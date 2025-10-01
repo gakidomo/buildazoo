@@ -1,0 +1,702 @@
+--[[ 
+  Mod Menu + AutoEgg (Single File Integration)
+  - Scan-once (rescan via tombol)
+  - Start/Stop, Collect Once, Level Override (popup), Mutations & Egg Types toggles
+  - Minimize & Exit (Exit = stop & destroy GUI, suspend script)
+]]
+
+-- ================== CONFIG ==================
+local ISLAND_PARENT_NAME = "Art"     -- island di Workspace.Art
+local BUY_COOLDOWN_SEC    = 0.35
+local RESCAN_INTERVAL_SEC = 1.25     -- jeda sweep (bukan re-scan)
+local MAX_BUYS_PER_MIN    = 120
+local LAST_BOUGHT_TTL_SEC = 4
+local ENABLE_LOG          = true
+
+-- filter awal (bisa diubah via toggle)
+local DESIRED_MUTATIONS = { Golden = false, Dino = false, Snow = false } -- aktif default
+local TYPE_ALLOW = {}                       -- kosong = semua type lolos
+local CONVEYOR_LEVEL_OVERRIDE = nil         -- nil=auto; angka=pakai Conveyor<n>
+-- ============================================
+
+-- ================== SERVICES =================
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+local StarterGui        = game:GetService("StarterGui")
+local RunService        = game:GetService("RunService")
+-- ============================================
+
+local function sys(msg)
+	pcall(function()
+		StarterGui:SetCore("ChatMakeSystemMessage", {Text = "[AutoEgg] "..tostring(msg)})
+	end)
+	if ENABLE_LOG then print("[AutoEgg]", msg) end
+end
+
+local LocalPlayer = Players.LocalPlayer
+local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Root        = Character:WaitForChild("HumanoidRootPart")
+
+-- ================== STATE (Controller) =================
+local running = false
+local suspended = false -- Exit → true
+local buysWindow = {}
+local lastBoughtAt = {} -- uid -> time
+local lastBuyInfo = { uid=nil, mut=nil, etype=nil, at=nil }
+
+-- scan-once cache
+local activeIsland   -- Instance|nil
+local activeConveyor -- Instance|nil
+local activeBelt     -- Instance|nil
+
+-- FPS connection (for cleanup on Exit)
+local fpsConn
+-- =======================================================
+
+-- ================== CONTROLLER CORE ====================
+local function _norm(s) return s and tostring(s):lower() or nil end
+
+local function canBuyNow()
+	local now = os.clock()
+	for i=#buysWindow,1,-1 do
+		if now - buysWindow[i] > 60 then table.remove(buysWindow, i) end
+	end
+	return #buysWindow < MAX_BUYS_PER_MIN
+end
+
+local function recordBuy(uid)
+	buysWindow[#buysWindow+1] = os.clock()
+	lastBoughtAt[uid] = os.clock()
+	lastBuyInfo.uid = uid
+	lastBuyInfo.at  = os.clock()
+end
+
+local function recentlyBought(uid)
+	local t = lastBoughtAt[uid]
+	return t and (os.clock() - t) < LAST_BOUGHT_TTL_SEC
+end
+
+-- sweeper anti growth
+task.spawn(function()
+	while true do
+		task.wait(30)
+		local now = os.clock()
+		for k, t in pairs(lastBoughtAt) do
+			if now - t > LAST_BOUGHT_TTL_SEC*3 then lastBoughtAt[k] = nil end
+		end
+	end
+end)
+
+local function findActiveIsland()
+	if not Root then return nil end
+	local parent = Workspace:FindFirstChild(ISLAND_PARENT_NAME) or Workspace
+	local best, bestDist = nil, math.huge
+	for _, m in ipairs(parent:GetChildren()) do
+		if m.Name:match("^Island_%d+$") then
+			local p = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true)
+			if p then
+				local d = (p.Position - Root.Position).Magnitude
+				if d < bestDist then best, bestDist = m, d end
+			end
+		end
+	end
+	return best
+end
+
+local function findConveyor(island, levelOverride)
+	if not island then return nil end
+	if levelOverride ~= nil then
+		local target = "Conveyor"..tostring(levelOverride)
+		for _, d in ipairs(island:GetDescendants()) do
+			if d:IsA("Model") and d.Name == target then return d end
+		end
+	end
+	-- auto: Conveyor%d+ punya Belt, level terbesar
+	local best, bestNum = nil, -1
+	for _, d in ipairs(island:GetDescendants()) do
+		if d:IsA("Model") then
+			local n = d.Name:match("^Conveyor(%d+)$")
+			if n and d:FindFirstChild("Belt") then
+				n = tonumber(n)
+				if n > bestNum then best, bestNum = d, n end
+			end
+		end
+	end
+	return best
+end
+
+local function getIslandEggFolder(islandModel)
+	local eggs = ReplicatedStorage:FindFirstChild("Eggs"); if not eggs then return nil end
+	return eggs:FindFirstChild(islandModel.Name)
+end
+
+local function iterValidEggs(islandModel, belt)
+	local folder = getIslandEggFolder(islandModel)
+	if not folder then return function() return nil end end
+	local list = {}
+	for _, item in ipairs(belt:GetChildren()) do
+		local uid = item.Name
+		local data = folder:FindFirstChild(uid)
+		if data then list[#list+1] = {uid=uid, data=data, item=item} end
+	end
+	local i = 0
+	return function() i += 1; return list[i] end
+end
+
+local function getEggType(eggData, beltItem)
+	if eggData then
+		local t = eggData:GetAttribute("T")
+		if t ~= nil then return tostring(t) end
+	end
+	if beltItem then
+		local t2 = beltItem:GetAttribute("Type")
+		if t2 ~= nil then return tostring(t2) end
+	end
+	return nil
+end
+
+local function isMutationMatch(data)
+	if not data then return false end
+	local m = data:GetAttribute("M")
+	return m and DESIRED_MUTATIONS[tostring(m)] == true
+end
+
+local function isTypeAllowed(etype)
+	if next(TYPE_ALLOW) == nil then return true end -- tidak ada filter → lolos semua
+	if not etype then return false end
+	return TYPE_ALLOW[_norm(etype)] == true
+end
+
+local function isMatch(eggData, beltItem)
+	if not isMutationMatch(eggData) then return false end
+	local etype = getEggType(eggData, beltItem)
+	return isTypeAllowed(etype)
+end
+
+local function getBuyRemote()
+	local remoteFolder = ReplicatedStorage:FindFirstChild("Remote")
+	if not remoteFolder then return nil end
+	return remoteFolder:FindFirstChild("CharacterRE")
+end
+
+local function fireBuy(uid)
+	local re = getBuyRemote()
+	if not re or not re:IsA("RemoteEvent") then
+		sys("❌ RemoteEvent ReplicatedStorage.Remote.CharacterRE tidak ditemukan.")
+		return false
+	end
+	local ok, err = pcall(function()
+		re:FireServer("BuyEgg", uid)
+	end)
+	if ok then return true else sys("❌ FireServer gagal: "..tostring(err)); return false end
+end
+
+local function beltAlive()
+	return activeBelt and activeBelt.Parent and activeBelt:IsDescendantOf(game)
+end
+
+local function rescanAll(reason)
+	if suspended then return false end
+	reason = reason or "manual"
+	activeIsland, activeConveyor, activeBelt = nil, nil, nil
+
+	local island = findActiveIsland()
+	if not island then sys(("Rescan (%s): ❌ Island tidak ketemu"):format(reason)); return false end
+	local conveyor = findConveyor(island, CONVEYOR_LEVEL_OVERRIDE)
+	if not conveyor then sys(("Rescan (%s): ❌ Conveyor tidak ketemu di %s"):format(reason, island.Name)); return false end
+	local belt = conveyor:FindFirstChild("Belt")
+	if not belt then sys(("Rescan (%s): ❌ Belt tidak ada di %s"):format(reason, conveyor.Name)); return false end
+
+	activeIsland, activeConveyor, activeBelt = island, conveyor, belt
+	sys(("Rescan (%s): ✅ %s → %s (Belt children: %d)")
+		:format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
+	return true
+end
+
+-- Owner check: pastikan pet ini milik LocalPlayer
+local function isMyPet(pet: Instance): boolean
+	-- atribut bisa Number atau String; kita normalisasi
+	local uidAttr = pet:GetAttribute("UserID") or pet:GetAttribute("UserId") or pet:GetAttribute("OwnerId")
+	if uidAttr == nil then return false end
+	local ownerId = (typeof(uidAttr) == "number") and uidAttr or tonumber(uidAttr)
+	if ownerId == nil then return false end
+	return ownerId == LocalPlayer.UserId
+end
+
+
+local function mainLoop()
+	sys("Loop mulai (scan-once). Gunakan Rescan jika pindah island/level.")
+	while running do
+		if suspended then break end
+		if not beltAlive() then
+			sys("Belt tidak tersedia. Klik Rescan.")
+			task.wait(RESCAN_INTERVAL_SEC)
+			continue
+		end
+		for e in iterValidEggs(activeIsland, activeBelt) do
+			if not running or suspended then break end
+			if isMatch(e.data, e.item) then
+				local uid = e.uid
+				if not recentlyBought(uid) and canBuyNow() then
+					if fireBuy(uid) then
+						recordBuy(uid)
+						lastBuyInfo.mut   = e.data:GetAttribute("M")
+						lastBuyInfo.etype = getEggType(e.data, e.item)
+						if ENABLE_LOG then
+							print(("[AutoEgg] BUY uid=%s M=%s Type=%s"):format(uid, tostring(lastBuyInfo.mut), tostring(lastBuyInfo.etype)))
+						end
+						task.wait(BUY_COOLDOWN_SEC)
+					end
+				end
+			end
+		end
+		task.wait(RESCAN_INTERVAL_SEC)
+	end
+	sys("Loop berhenti.")
+end
+
+local function start()
+	if suspended then sys("Script disuspend (Exit). Reload script untuk menjalankan lagi."); return false end
+	if running then return true end
+	if not beltAlive() then
+		local ok = rescanAll("initial")
+		if not ok then return false, "Rescan gagal" end
+	end
+	running = true
+	task.spawn(mainLoop)
+	return true
+end
+
+local function stop()
+	running = false
+	return true
+end
+
+local function collectOnce()
+	if suspended then return false end
+	task.spawn(function()
+		local petsFolder = Workspace:FindFirstChild("Pets") or Workspace:WaitForChild("Pets", 3)
+		if not petsFolder then
+			sys("❌ Workspace.Pets tidak ditemukan.")
+			return
+		end
+
+		local total = #petsFolder:GetChildren()
+		local processedMine, success, skippedOthers = 0, 0, 0
+		sys(("Collect (milikmu saja) dari %d pets di dunia…"):format(total))
+
+		for _, pet in ipairs(petsFolder:GetChildren()) do
+			-- hanya proses kalau pet ini milik kita
+			if isMyPet(pet) then
+				local rootPart = pet:FindFirstChild("RootPart")
+				if rootPart then
+					local remote = rootPart:FindFirstChild("RE")
+					if remote and remote:IsA("RemoteEvent") then
+						local ok = pcall(function()
+							remote:FireServer("Claim")
+						end)
+						processedMine += 1
+						if ok then success += 1 end
+						task.wait(0.05) -- jeda aman per pet
+					end
+				end
+			else
+				skippedOthers += 1
+			end
+		end
+
+		sys(("Collect selesai. Milikmu diproses: %d | Berhasil: %d | Di-skip (bukan punyamu): %d")
+			:format(processedMine, success, skippedOthers))
+	end)
+	return true
+end
+
+
+local function setLevel(n)
+	if suspended then return false end
+	if n == nil then CONVEYOR_LEVEL_OVERRIDE = nil; return true end
+	local num = tonumber(n); if not num then return false, "level harus angka atau nil" end
+	CONVEYOR_LEVEL_OVERRIDE = num; return true
+end
+
+local function getStatus()
+	local function age(t)
+		if not t then return "-" end
+		local s = os.clock() - t
+		if s < 1 then return "now" end
+		return ("%0.1fs ago"):format(s)
+	end
+	return {
+		running = running,
+		island = activeIsland and activeIsland.Name or "-",
+		conveyor = activeConveyor and activeConveyor.Name or "-",
+		beltChildren = activeBelt and #activeBelt:GetChildren() or 0,
+		buysPerMinWindow = #buysWindow,
+		levelOverride = CONVEYOR_LEVEL_OVERRIDE,
+		lastBuy = { uid=lastBuyInfo.uid, mut=lastBuyInfo.mut, type=lastBuyInfo.etype, when=age(lastBuyInfo.at) },
+	}
+end
+
+local function scanCurrentMutations()
+	local set = {}
+	if not beltAlive() then return set end
+	for e in iterValidEggs(activeIsland, activeBelt) do
+		local m = e.data:GetAttribute("M")
+		if m then set[tostring(m)] = true end
+	end
+	return set
+end
+
+local function scanCurrentTypes()
+	local counts = {} -- lower -> {name=asSeen, n=count}
+	if not beltAlive() then return counts end
+	for e in iterValidEggs(activeIsland, activeBelt) do
+		local et = getEggType(e.data, e.item)
+		if et then
+			local key = _norm(et)
+			if not counts[key] then counts[key] = {name=et, n=0} end
+			counts[key].n += 1
+		end
+	end
+	return counts
+end
+-- ================== /CONTROLLER CORE ====================
+
+
+-- ================== GUI (template + integration) ==================
+-- (Template kamu, ditambah Status label + Minimize + Exit)
+
+-- Root GUI
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ModMenu"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = game:GetService("CoreGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0.2, 0, 0.8, 0)
+MainFrame.Position = UDim2.new(0.4, 0, 0.1, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0.1, 0)
+UICorner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0.08, 0) -- sedikit lebih tipis utk space status
+Title.Text = "Mod Menu"
+Title.TextSize = 30
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.BackgroundTransparency = 1
+Title.Font = Enum.Font.SourceSansBold
+Title.Parent = MainFrame
+
+-- Minimize & Exit buttons
+local MinBtn = Instance.new("TextButton")
+MinBtn.Size = UDim2.new(0, 28, 0, 22)
+MinBtn.Position = UDim2.new(1, -64, 0, 6)
+MinBtn.Text = "—"
+MinBtn.TextScaled = true
+MinBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+MinBtn.TextColor3 = Color3.new(1,1,1)
+MinBtn.Font = Enum.Font.SourceSansBold
+MinBtn.Parent = MainFrame
+local MinUIC = Instance.new("UICorner", MinBtn) MinUIC.CornerRadius = UDim.new(0,6)
+
+local ExitBtn = Instance.new("TextButton")
+ExitBtn.Size = UDim2.new(0, 28, 0, 22)
+ExitBtn.Position = UDim2.new(1, -32, 0, 6)
+ExitBtn.Text = "×"
+ExitBtn.TextScaled = true
+ExitBtn.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+ExitBtn.TextColor3 = Color3.new(1,1,1)
+ExitBtn.Font = Enum.Font.SourceSansBold
+ExitBtn.Parent = MainFrame
+local ExitUIC = Instance.new("UICorner", ExitBtn) ExitUIC.CornerRadius = UDim.new(0,6)
+
+local FPSCounter = Instance.new("TextLabel")
+FPSCounter.Size = UDim2.new(1, 0, 0.05, 0)
+FPSCounter.Position = UDim2.new(0, 0, 0.08, 0)
+FPSCounter.Text = "FPS: 0"
+FPSCounter.TextColor3 = Color3.fromRGB(255, 255, 255)
+FPSCounter.BackgroundTransparency = 1
+FPSCounter.Font = Enum.Font.SourceSans
+FPSCounter.TextSize = 18
+FPSCounter.Parent = MainFrame
+
+-- Status label ringkas
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(1, 0, 0.07, 0)
+StatusLabel.Position = UDim2.new(0, 0, 0.13, 0)
+StatusLabel.Text = "Status: -"
+StatusLabel.TextColor3 = Color3.fromRGB(230, 230, 235)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Font = Enum.Font.SourceSans
+StatusLabel.TextSize = 16
+StatusLabel.TextWrapped = true
+StatusLabel.Parent = MainFrame
+
+local ButtonsContainer = Instance.new("Frame")
+ButtonsContainer.Size = UDim2.new(1, 0, 0.67, 0)  -- dikurangi sedikit (kita pakai status)
+ButtonsContainer.Position = UDim2.new(0, 0, 0.20, 0)
+ButtonsContainer.BackgroundTransparency = 1
+ButtonsContainer.ClipsDescendants = true
+ButtonsContainer.Parent = MainFrame
+
+local UIListLayout = Instance.new("UIListLayout")
+UIListLayout.FillDirection = Enum.FillDirection.Vertical
+UIListLayout.Padding = UDim.new(0.02, 0)
+UIListLayout.Parent = ButtonsContainer
+
+local PageLeft = Instance.new("TextButton")
+PageLeft.Size = UDim2.new(0.5, 0, 0.05, 0)
+PageLeft.Position = UDim2.new(0, 0, 0.95, 0)
+PageLeft.Text = "<"
+PageLeft.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+PageLeft.Font = Enum.Font.SourceSansBold
+PageLeft.TextSize = 20
+PageLeft.Parent = MainFrame
+
+local PageRight = Instance.new("TextButton")
+PageRight.Size = UDim2.new(0.5, 0, 0.05, 0)
+PageRight.Position = UDim2.new(0.5, 0, 0.95, 0)
+PageRight.Text = ">"
+PageRight.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+PageRight.Font = Enum.Font.SourceSansBold
+PageRight.TextSize = 20
+PageRight.Parent = MainFrame
+
+-- FPS updater (store connection to clean on Exit)
+fpsConn = RunService.RenderStepped:Connect(function(dt)
+    FPSCounter.Text = "FPS: " .. tostring(math.floor(1 / math.max(dt, 1/300)))
+end)
+
+-- ================== BUTTON MODEL ==================
+local buttons = {}
+local currentPage = 1
+local itemsPerPage = 6
+
+-- helper: buat 1 tombol UI (warna & corner)
+local function stylizeBtn(btn, isToggle, toggled)
+	btn.BackgroundColor3 = (isToggle and toggled) and Color3.fromRGB(100, 200, 100) or Color3.fromRGB(200, 200, 200)
+	btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+	btn.Font = Enum.Font.SourceSans
+	btn.TextSize = 20
+	local UICornerBtn = Instance.new("UICorner")
+	UICornerBtn.CornerRadius = UDim.new(0.1, 0)
+	UICornerBtn.Parent = btn
+end
+
+-- RENDER PAGE
+local function renderPage(page)
+	for _, child in ipairs(ButtonsContainer:GetChildren()) do
+		if child:IsA("TextButton") then child:Destroy() end
+	end
+	local startIndex = (page - 1) * itemsPerPage + 1
+	local endIndex = math.min(page * itemsPerPage, #buttons)
+
+	for i = startIndex, endIndex do
+		local item = buttons[i]
+		local btn = Instance.new("TextButton", ButtonsContainer)
+		btn.Size = UDim2.new(1, 0, 0, 38)
+		btn.Text = item.name
+
+		if item.type == "button" then
+			stylizeBtn(btn, false)
+			btn.MouseButton1Click:Connect(item.callback)
+
+		elseif item.type == "toggle" then
+			local toggled = item.initial == true
+			stylizeBtn(btn, true, toggled)
+			btn.MouseButton1Click:Connect(function()
+				toggled = not toggled
+				stylizeBtn(btn, true, toggled)
+				if toggled then
+					if item.on then item.on() end
+				else
+					if item.off then item.off() end
+				end
+			end)
+		end
+	end
+end
+
+PageLeft.MouseButton1Click:Connect(function()
+	if currentPage > 1 then
+		currentPage -= 1
+		renderPage(currentPage)
+	end
+end)
+
+PageRight.MouseButton1Click:Connect(function()
+	if currentPage < math.ceil(#buttons / itemsPerPage) then
+		currentPage += 1
+		renderPage(currentPage)
+	end
+end)
+
+-- ================== POPUP LEVEL ==================
+local function promptLevel()
+	if suspended then return end
+	-- overlay kecil di atas MainFrame
+	local popup = Instance.new("Frame")
+	popup.Size = UDim2.new(0, 240, 0, 120)
+	popup.Position = UDim2.new(0.5, -120, 0.5, -60)
+	popup.BackgroundColor3 = Color3.fromRGB(45,45,50)
+	popup.Parent = MainFrame
+	local c = Instance.new("UICorner", popup) c.CornerRadius = UDim.new(0,10)
+	local s = Instance.new("UIStroke", popup) s.Thickness = 1 s.Color = Color3.fromRGB(70,70,80)
+
+	local lab = Instance.new("TextLabel")
+	lab.Size = UDim2.new(1, -20, 0, 24); lab.Position = UDim2.new(0,10, 0,10)
+	lab.BackgroundTransparency = 1; lab.Text = "Level Override (kosong = auto)"
+	lab.TextColor3 = Color3.fromRGB(230,230,235); lab.Font = Enum.Font.SourceSans; lab.TextSize = 16
+	lab.Parent = popup
+
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(1, -20, 0, 28); box.Position = UDim2.new(0,10, 0, 42)
+	box.PlaceholderText = "contoh: 7   (atau kosong)"
+	box.Text = ""
+	box.TextScaled = false; box.TextSize = 16
+	box.Font = Enum.Font.SourceSans
+	box.BackgroundColor3 = Color3.fromRGB(30,30,34)
+	box.TextColor3 = Color3.fromRGB(240,240,245)
+	box.Parent = popup
+	local bc = Instance.new("UICorner", box) bc.CornerRadius = UDim.new(0,8)
+
+	local ap = Instance.new("TextButton")
+	ap.Size = UDim2.new(0.5, -15, 0, 28); ap.Position = UDim2.new(0,10, 1, -38)
+	ap.Text = "Apply"; ap.BackgroundColor3 = Color3.fromRGB(80,120,200); ap.TextColor3 = Color3.new(1,1,1)
+	ap.Font = Enum.Font.SourceSansBold; ap.TextSize = 18; ap.Parent = popup
+	local apc = Instance.new("UICorner", ap) apc.CornerRadius = UDim.new(0,8)
+
+	local ca = Instance.new("TextButton")
+	ca.Size = UDim2.new(0.5, -15, 0, 28); ca.Position = UDim2.new(0.5, 5, 1, -38)
+	ca.Text = "Cancel"; ca.BackgroundColor3 = Color3.fromRGB(120,120,120); ca.TextColor3 = Color3.new(1,1,1)
+	ca.Font = Enum.Font.SourceSansBold; ca.TextSize = 18; ca.Parent = popup
+	local cac = Instance.new("UICorner", ca) cac.CornerRadius = UDim.new(0,8)
+
+	ap.MouseButton1Click:Connect(function()
+		local txt = string.gsub(box.Text or "", "^%s*(.-)%s*$", "%1")
+		if txt == "" then
+			setLevel(nil); sys("Level override: AUTO")
+		else
+			local num = tonumber(txt)
+			if not num then
+				sys("Level harus angka. Contoh: 7")
+				return
+			end
+			setLevel(num); sys("Level override di-set: "..num)
+		end
+		popup:Destroy()
+	end)
+	ca.MouseButton1Click:Connect(function() popup:Destroy() end)
+end
+
+-- ================== BUTTONS REBUILD ==================
+local function rebuildButtons()
+	buttons = {}
+	-- CORE CONTROLS
+	table.insert(buttons, {name="Start",  type="button", callback=function() local ok,err=start(); if not ok and err then sys("Start gagal: "..tostring(err)) end end})
+	table.insert(buttons, {name="Stop",   type="button", callback=function() stop() end})
+	table.insert(buttons, {name="Rescan", type="button", callback=function()
+		if rescanAll("gui") then
+			-- setelah rescan, rebuild lagi agar toggle Mutations/Types sesuai data terbaru
+			rebuildButtons()
+			currentPage = 1
+			renderPage(currentPage)
+		end
+	end})
+	table.insert(buttons, {name="Collect Once", type="button", callback=function() collectOnce() end})
+	table.insert(buttons, {name="Set Level…",   type="button", callback=function() promptLevel() end})
+	table.insert(buttons, {name="Auto Level",   type="button", callback=function() setLevel(nil); sys("Level override: AUTO") end})
+
+	-- MUTATIONS (scan dari belt aktif)
+	local mutSet = scanCurrentMutations()
+	for mName,_ in pairs(mutSet) do
+		local onNow = DESIRED_MUTATIONS[tostring(mName)] == true
+		table.insert(buttons, {
+			name = "[M] "..tostring(mName),
+			type = "toggle",
+			initial = onNow,
+			on  = function() DESIRED_MUTATIONS[tostring(mName)] = true  end,
+			off = function() DESIRED_MUTATIONS[tostring(mName)] = false end,
+		})
+	end
+
+	-- TYPE TOGGLES (scan dari belt aktif)
+	local counts = scanCurrentTypes()
+	for key, info in pairs(counts) do
+		local onNow = (TYPE_ALLOW[key] == true)
+		table.insert(buttons, {
+			name = ("[T] %s  (x%d)"):format(info.name, info.n),
+			type = "toggle",
+			initial = onNow,
+			on  = function() TYPE_ALLOW[_norm(info.name)] = true  end,
+			off = function() TYPE_ALLOW[_norm(info.name)] = false end,
+		})
+	end
+
+	-- TYPE UTILS
+	table.insert(buttons, {name="Refresh Types", type="button", callback=function() rebuildButtons(); renderPage(currentPage) end})
+	table.insert(buttons, {name="Clear Types",   type="button", callback=function()
+		for k,_ in pairs(TYPE_ALLOW) do TYPE_ALLOW[k] = nil end
+		sys("Filter types dikosongkan.")
+		rebuildButtons(); renderPage(currentPage)
+	end})
+end
+
+-- ===== Status updater
+local function fmt(v) return v == nil and "-" or tostring(v) end
+local function renderStatus()
+	local st = getStatus()
+	local runTxt = st.running and "RUNNING" or "STOPPED"
+	StatusLabel.Text = string.format(
+	  "Status: %s | Island:%s | Conveyor:%s | Belt:%d | Level:%s\nLast:%s (M=%s, T=%s) %s",
+	  runTxt, fmt(st.island), fmt(st.conveyor), tonumber(st.beltChildren) or 0,
+	  st.levelOverride and tostring(st.levelOverride) or "auto",
+	  fmt(st.lastBuy.uid), fmt(st.lastBuy.mut), fmt(st.lastBuy.type), fmt(st.lastBuy.when)
+	)
+end
+
+-- ===== Minimize / Exit behavior
+local minimized = false
+MinBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	ButtonsContainer.Visible = not minimized
+	PageLeft.Visible = not minimized
+	PageRight.Visible = not minimized
+	StatusLabel.Visible = not minimized
+	if minimized then
+		MainFrame.Size = UDim2.new(0.2, 0, 0.16, 0)
+		MinBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 200)
+	else
+		MainFrame.Size = UDim2.new(0.2, 0, 0.8, 0)
+		MinBtn.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	end
+end)
+
+ExitBtn.MouseButton1Click:Connect(function()
+	-- stop everything and destroy GUI
+	stop()
+	suspended = true
+	if fpsConn then pcall(function() fpsConn:Disconnect() end) end
+	ScreenGui:Destroy()
+	sys("Script disuspend via Exit. Reload script untuk menjalankan lagi.")
+end)
+
+-- ===== INIT =====
+rebuildButtons()
+renderPage(currentPage)
+renderStatus()
+
+task.spawn(function()
+	while ScreenGui.Parent do
+		renderStatus()
+		task.wait(0.75)
+	end
+end)
