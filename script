@@ -1,1 +1,1 @@
-sys("repo private")
+print("test loadstring")
