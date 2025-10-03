@@ -1,0 +1,44 @@
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local myUserId = LocalPlayer and LocalPlayer.UserId
+
+local args = { "Claim" }
+
+local pets = workspace:WaitForChild("Pets", 5)
+if not pets then
+    warn("[CollectOnce] Workspace.Pets tidak ditemukan.")
+    return
+end
+
+local processedMine, success, skippedOthers = 0, 0, 0
+
+for _, pet in ipairs(pets:GetChildren()) do
+    -- deteksi owner dari atribut
+    local ownerAttr = pet:GetAttribute("UserID") or pet:GetAttribute("UserId") or pet:GetAttribute("OwnerId")
+    local ownerId = nil
+    if typeof(ownerAttr) == "number" then
+        ownerId = ownerAttr
+    else
+        ownerId = tonumber(ownerAttr)
+    end
+
+    if ownerId == myUserId then
+        local rootPart = pet:FindFirstChild("RootPart")
+        if rootPart then
+            local remote = rootPart:FindFirstChild("RE")
+            if remote and remote:IsA("RemoteEvent") then
+                local ok = pcall(function()
+                    remote:FireServer(unpack(args)) -- "Claim"
+                end)
+                processedMine += 1
+                if ok then success += 1 end
+                task.wait(0.03)
+            end
+        end
+    else
+        skippedOthers += 1
+    end
+end
+
+print(string.format("[CollectOnce] Selesai. Milikmu: %d | Berhasil: %d | Skip (bukan punyamu): %d",
+    processedMine, success, skippedOthers))
