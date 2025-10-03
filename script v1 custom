@@ -1,0 +1,490 @@
+-- Tahap 6: Auto-Buy Egg (mutasi) + chat control
+-- Signature: ReplicatedStorage.Remote.CharacterRE:FireServer("BuyEgg", uid)
+
+
+-- ============== CONFIG =================
+local ISLAND_PARENT_NAME = "Art"             -- island ada di Workspace.Art
+
+local CONVEYOR_LEVEL_OVERRIDE = nil          -- contoh: 8 (nil = auto-detect Conveyor%d+)
+
+local BUY_COOLDOWN_SEC = 0.35                -- jeda antar buy
+local RESCAN_INTERVAL_SEC = 1.5              -- jeda rescan belt
+local MAX_BUYS_PER_MIN = 120                 -- guardrail anti-spam
+local LAST_BOUGHT_TTL_SEC = 4                -- cegah spam UID yg sama
+local ENABLE_LOG = true
+
+-- ===== Auto-Collect (Pets) CONFIG =====
+local COLLECT_SLEEP_PER_PET = 0.05   -- jeda antar fire biar aman
+local COLLECT_MAX_PETS = nil         -- batasi jumlah (mis. 50). nil = semua
+
+-- ===== Egg Type Filter (case-insensitive) =====
+local ENABLE_TYPE_FILTER = true
+-- Jika TYPE_ALLOW kosong => tidak memfilter jenis (semua lolos)
+-- Isi contoh: TYPE_ALLOW = { ["bowspawnegg"]=true, ["glitchegg"]=true }
+
+
+-- ======================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local TextChatService = game:GetService("TextChatService")
+
+local localPlayer = Players.LocalPlayer
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local root = character:WaitForChild("HumanoidRootPart")
+
+local function sys(t)
+	pcall(function() StarterGui:SetCore("ChatMakeSystemMessage",{Text="[AutoEgg] "..t}) end)
+	if ENABLE_LOG then print("[AutoEgg]", t) end
+end
+
+-- ======= STATE HASIL SCAN (cache) =======
+local activeIsland  -- Instance | nil
+local activeConveyor -- Instance | nil
+local activeBelt    -- Instance | nil
+
+local function beltAlive()
+	return activeBelt and activeBelt.Parent and activeBelt:IsDescendantOf(game)
+end
+
+
+-- ---------- Helpers: island / conveyor / belt ----------
+local function findActiveIsland()
+	local parent = Workspace:FindFirstChild(ISLAND_PARENT_NAME) or Workspace
+	local best, bestDist = nil, math.huge
+	for _, m in ipairs(parent:GetChildren()) do
+		if m.Name:match("^Island_%d+$") then
+			local p = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true)
+			if p then
+				local d = (p.Position - root.Position).Magnitude
+				if d < bestDist then best, bestDist = m, d end
+			end
+		end
+	end
+	return best
+end
+
+local function findConveyor(island, levelOverride)
+	if not island then return nil end
+	if levelOverride then
+		local target = "Conveyor"..tostring(levelOverride)
+		for _, d in ipairs(island:GetDescendants()) do
+			if d:IsA("Model") and d.Name == target then return d end
+		end
+	end
+	-- auto: cari Conveyor%d+ yang punya Belt; ambil level terbesar
+	local best, bestNum = nil, -1
+	for _, d in ipairs(island:GetDescendants()) do
+		if d:IsA("Model") then
+			local n = d.Name:match("^Conveyor(%d+)$")
+			if n and d:FindFirstChild("Belt") then
+				n = tonumber(n)
+				if n > bestNum then best, bestNum = d, n end
+			end
+		end
+	end
+	return best
+end
+
+-- Scan semua SEKALI, simpan ke state cache
+local function rescanAll(reason: string?)
+	reason = reason or "manual"
+	activeIsland, activeConveyor, activeBelt = nil, nil, nil
+
+	local island = findActiveIsland()
+	if not island then
+		sys(("Rescan (%s): ❌ Island tidak ketemu."):format(reason))
+		return false
+	end
+
+	local conveyor = findConveyor(island, CONVEYOR_LEVEL_OVERRIDE)
+	if not conveyor then
+		sys(("Rescan (%s): ❌ Conveyor tidak ketemu di %s."):format(reason, island.Name))
+		return false
+	end
+
+	local belt = conveyor:FindFirstChild("Belt")
+	if not belt then
+		sys(("Rescan (%s): ❌ Belt tidak ada di %s."):format(reason, conveyor.Name))
+		return false
+	end
+
+	activeIsland, activeConveyor, activeBelt = island, conveyor, belt
+	sys(("Rescan (%s): ✅ %s → %s (Belt children: %d)")
+		:format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
+	return true
+end
+
+-- Jalankan scan awal SEKALI saat script boot
+task.defer(function()
+	rescanAll("initial")
+end)
+
+
+-- ---------- Validasi egg & mutasi ----------
+local function getIslandEggFolder(islandModel)
+	local eggs = ReplicatedStorage:FindFirstChild("Eggs"); if not eggs then return nil end
+	return eggs:FindFirstChild(islandModel.Name)
+end
+
+local function iterValidEggs(islandModel, belt)
+	local folder = getIslandEggFolder(islandModel)
+	if not folder then return function() return nil end end
+	local list = {}
+	for _, item in ipairs(belt:GetChildren()) do
+		local uid = item.Name
+		local data = folder:FindFirstChild(uid)
+		if data then
+			table.insert(list, {uid=uid, data=data, item=item})
+		end
+	end
+	local i = 0
+	return function() i += 1; return list[i] end
+end
+
+local function isMutationMatch(data)
+	if not data then return false end
+	local m = data:GetAttribute("M")
+	return m and DESIRED_MUTATIONS[tostring(m)] == true
+end
+
+-- normalisasi string ke lower
+local function _norm(s)
+	if s == nil then return nil end
+	return tostring(s):lower()
+end
+
+-- baca egg type (prefer dari ReplicatedStorage.Eggs[UID].T, fallback ke atribut pada item Belt)
+local function getEggType(eggData: Instance?, beltItem: Instance?)
+	-- dari data RS
+	if eggData then
+		local t = eggData:GetAttribute("T")
+		if t ~= nil then return tostring(t) end
+	end
+	-- fallback dari belt item
+	if beltItem then
+		local t2 = beltItem:GetAttribute("Type")
+		if t2 ~= nil then return tostring(t2) end
+	end
+	return nil
+end
+
+-- cek apakah type diizinkan (jika TYPE_ALLOW kosong => semua diizinkan)
+local function isTypeAllowed(etype: string?)
+	if not ENABLE_TYPE_FILTER then return true end
+	if next(TYPE_ALLOW) == nil then return true end  -- tidak ada filter => allow all
+	if not etype then return false end               -- minta ada tipe yang terdeteksi
+	return TYPE_ALLOW[_norm(etype)] == true
+end
+
+-- gabungkan dengan filter mutasi yang sudah ada
+local function isMatch(eggData: Instance?, beltItem: Instance?)
+	if not isMutationMatch(eggData) then return false end
+	local etype = getEggType(eggData, beltItem)
+	return isTypeAllowed(etype)
+end
+
+
+-- ---------- Remote pembelian ----------
+local function getBuyRemote()
+	local remoteFolder = ReplicatedStorage:WaitForChild("Remote", 5)
+	if not remoteFolder then return nil end
+	return remoteFolder:FindFirstChild("CharacterRE")
+end
+
+local function fireBuy(uid)
+	local re = getBuyRemote()
+	if not re or not re:IsA("RemoteEvent") then
+		sys("❌ RemoteEvent ReplicatedStorage.Remote.CharacterRE tidak ditemukan.")
+		return false
+	end
+	local ok, err = pcall(function()
+		re:FireServer("BuyEgg", uid) -- SIGNATURE
+	end)
+	if ok then return true else sys("❌ FireServer gagal: "..tostring(err)); return false end
+end
+
+-- ========== ONE-SHOT AUTO COLLECT PETS ==========
+local collecting = false
+
+local function oneShotCollectPets()
+	if collecting then
+		sys("Collect lagi berjalan. Tunggu selesai ya.")
+		return
+	end
+	collecting = true
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			-- cari folder Pets
+			local petsFolder = Workspace:FindFirstChild("Pets") or Workspace:WaitForChild("Pets", 3)
+			if not petsFolder then
+				sys("❌ Folder Workspace.Pets tidak ditemukan.")
+				return
+			end
+
+			local processed, success, total = 0, 0, #petsFolder:GetChildren()
+			sys(("Mulai collect dari %d pets…"):format(total))
+
+			for _, pet in ipairs(petsFolder:GetChildren()) do
+				if COLLECT_MAX_PETS and processed >= COLLECT_MAX_PETS then break end
+				local rootPart = pet:FindFirstChild("RootPart")
+				if rootPart then
+					local remote = rootPart:FindFirstChild("RE")
+					if remote and remote:IsA("RemoteEvent") then
+						local okFire, errFire = pcall(function()
+							remote:FireServer("Claim")
+						end)
+						processed += 1
+						if okFire then success += 1 else
+							if ENABLE_LOG then warn("[AutoEgg] Collect gagal:", errFire) end
+						end
+						if COLLECT_SLEEP_PER_PET and COLLECT_SLEEP_PER_PET > 0 then
+							task.wait(COLLECT_SLEEP_PER_PET)
+						end
+					end
+				end
+			end
+
+			sys(("Collect selesai. Diproses: %d | Berhasil: %d"):format(processed, success))
+		end)
+
+		if not ok then
+			sys("❌ Collect error: "..tostring(err))
+		end
+		collecting = false
+	end)
+end
+
+
+-- ---------- Rate limit & anti double ----------
+local buysWindow = {}
+local lastBoughtAt = {} -- uid -> time
+
+local function canBuyNow()
+	local now = os.clock()
+	for i = #buysWindow, 1, -1 do
+		if now - buysWindow[i] > 60 then table.remove(buysWindow, i) end
+	end
+	return #buysWindow < MAX_BUYS_PER_MIN
+end
+
+local function recordBuy(uid)
+	buysWindow[#buysWindow+1] = os.clock()
+	lastBoughtAt[uid] = os.clock()
+end
+
+local function recentlyBought(uid)
+	local t = lastBoughtAt[uid]
+	return t and (os.clock() - t) < LAST_BOUGHT_TTL_SEC
+end
+
+-- ---------- Main loop ----------
+local running = false
+local mainLoop
+function mainLoop()
+	sys("Loop mulai (mode: scan-once). Ketik !buyegg rescan jika berpindah island/bertukar conveyor.")
+	while running do
+		-- Tidak melakukan re-scan otomatis.
+		-- Hanya jalan jika hasil scan awal ada & masih valid.
+		if not beltAlive() then
+			sys("Belt tidak tersedia. Gunakan !buyegg rescan.")
+			task.wait(RESCAN_INTERVAL_SEC)
+			continue
+		end
+
+		-- Iterasi hanya pada cache: activeIsland + activeBelt
+		for e in iterValidEggs(activeIsland, activeBelt) do
+			if not running then break end
+			if isMatch(e.data, e.item) then
+				local uid = e.uid
+				if not recentlyBought(uid) and canBuyNow() then
+					if fireBuy(uid) then
+						recordBuy(uid)
+						if ENABLE_LOG then
+							local m = e.data:GetAttribute("M")
+							print(("[AutoEgg] BUY uid=%s M=%s"):format(uid, tostring(m)))
+						end
+						task.wait(BUY_COOLDOWN_SEC)
+					end
+				end
+			end
+		end
+
+		task.wait(RESCAN_INTERVAL_SEC) -- cuma delay antar sweep, bukan re-scan
+	end
+	sys("Loop berhenti.")
+end
+
+
+-- ---------- Chat commands ----------
+local PREFIX, BASE = "!", "buyegg"
+local function listActiveMutations()
+	local t = {}
+	for k,v in pairs(DESIRED_MUTATIONS) do if v then t[#t+1]=k end end
+	table.sort(t); return #t>0 and table.concat(t,", ") or "(kosong)"
+end
+
+local function tryParseCommand(msg)
+	if not msg or msg:sub(1,#PREFIX) ~= PREFIX then return end
+	local parts = string.split(msg:sub(#PREFIX+1), " ")
+	if #parts==0 then return end
+	parts[1] = parts[1]:lower()
+	if parts[1] ~= BASE then return end
+
+	local sub = (parts[2] or "help"):lower()
+
+	if sub == "start" then
+		if running then sys("Sudah berjalan.") else running = true; task.spawn(mainLoop); sys("Dimulai.") end
+
+	elseif sub == "collect" then
+		oneShotCollectPets()
+
+	elseif sub == "stop" then
+		if running then running = false; sys("Dihentikan.") else sys("Sudah berhenti.") end
+
+    elseif sub == "rescan" then
+	local ok = rescanAll("manual")
+	if not ok then
+		sys("Rescan gagal. Pastikan kamu berada di dekat island & conveyor yang benar.")
+	end
+
+    elseif sub == "types" then
+	-- ringkas tipe yang sedang ada di belt aktif + status allow/deny
+	if not activeIsland or not activeBelt then
+		sys("Belt belum aktif. Gunakan !buyegg rescan dulu.")
+	else
+		local counts = {}   -- etype(lower) -> {name=asSeen, n=count}
+		for e in iterValidEggs(activeIsland, activeBelt) do
+			local et = getEggType(e.data, e.item)
+			if et then
+				local key = _norm(et)
+				if not counts[key] then counts[key] = {name = et, n = 0} end
+				counts[key].n += 1
+			end
+		end
+		local total = 0
+		for _, v in pairs(counts) do total += v.n end
+		if total == 0 then
+			sys("Tidak ada egg type terdeteksi di belt saat ini.")
+		else
+			sys(("Egg types di belt (total %d):"):format(total))
+			for key, v in pairs(counts) do
+				local flag = TYPE_ALLOW[key] and "ON" or "off"
+				sys(("- %s  (count=%d, filter=%s)"):format(v.name, v.n, flag))
+				task.wait(0.02)
+			end
+		end
+	end
+
+    elseif sub == "settype" then
+        -- !buyegg settype <TypeName> on|off
+        local name = parts[3]
+        local onoff = parts[4] and parts[4]:lower()
+        if not name or (onoff ~= "on" and onoff ~= "off") then
+            sys("Pakai: !buyegg settype <TypeName> on|off   (contoh: !buyegg settype BowserEgg on)")
+        else
+            TYPE_ALLOW[_norm(name)] = (onoff == "on")
+            sys(("Filter type %s: %s"):format(name, onoff == "on" and "ON" or "off"))
+        end
+
+    elseif sub == "onlytype" then
+        -- !buyegg onlytype <Type1,Type2,...>
+        local list = parts[3]
+        if not list or #list == 0 then
+            sys("Pakai: !buyegg onlytype <Type1,Type2,...>")
+        else
+            -- reset & set hanya daftar ini
+            for k,_ in pairs(TYPE_ALLOW) do TYPE_ALLOW[k] = nil end
+            for token in string.gmatch(list, "([^,]+)") do
+                TYPE_ALLOW[_norm(token:gsub("^%s*(.-)%s*$","%1"))] = true
+            end
+            sys("Filter types di-set eksklusif. Cek dengan !buyegg types")
+        end
+
+    elseif sub == "cleartypes" then
+        for k,_ in pairs(TYPE_ALLOW) do TYPE_ALLOW[k] = nil end
+        sys("Filter types dikosongkan (semua tipe diizinkan).")
+
+
+
+	elseif sub == "status" then
+		sys(("Status: %s | Mutasi aktif: %s | Level: %s | Window buys: %d/min")
+			:format(running and "BERJALAN" or "BERHENTI",
+				listActiveMutations(),
+				CONVEYOR_LEVEL_OVERRIDE and tostring(CONVEYOR_LEVEL_OVERRIDE) or "auto",
+				#buysWindow))
+
+	elseif sub == "eggs" then
+		local island = findActiveIsland(); if not island then sys("Island?"); return end
+		local conveyor = findConveyor(island, CONVEYOR_LEVEL_OVERRIDE); if not conveyor then sys("Conveyor?"); return end
+		local belt = conveyor:FindFirstChild("Belt"); if not belt then sys("Belt?"); return end
+		local shown, folder = 0, getIslandEggFolder(island)
+		for e in iterValidEggs(island, belt) do
+			local m = e.data:GetAttribute("M")
+			sys(("[%02d] uid=%s | M=%s | match=%s"):format(shown+1, e.uid, tostring(m), tostring(isMutationMatch(e.data))))
+			shown += 1; if shown >= 15 then break end
+		end
+		if shown == 0 then sys("Tidak ada egg valid terdeteksi di Belt.") end
+
+	elseif sub == "setlevel" then
+		local p = parts[3]
+		if p == nil or p == "auto" then
+			CONVEYOR_LEVEL_OVERRIDE = nil
+			sys("Conveyor level: AUTO")
+		else
+			local n = tonumber(p)
+			if n then
+				CONVEYOR_LEVEL_OVERRIDE = n
+				sys("Conveyor level di-set ke: "..n)
+			else
+				sys("Pakai: !buyegg setlevel <n|auto>")
+			end
+		end
+
+	elseif sub == "setmut" then
+		local name = parts[3]; local onoff = parts[4] and parts[4]:lower()
+		if not name or (onoff ~= "on" and onoff ~= "off") then
+			sys("Pakai: !buyegg setmut <Nama> on|off (contoh: !buyegg setmut Golden on)")
+			return
+		end
+		DESIRED_MUTATIONS[name] = (onoff == "on")
+		sys("Mutasi aktif sekarang: "..listActiveMutations())
+
+	elseif sub == "test" then
+		local island = findActiveIsland(); if not island then sys("Island?"); return end
+		local conveyor = findConveyor(island, CONVEYOR_LEVEL_OVERRIDE); if not conveyor then sys("Conveyor?"); return end
+		local belt = conveyor:FindFirstChild("Belt"); if not belt then sys("Belt?"); return end
+		for e in iterValidEggs(island, belt) do
+			if isMatch(e.data, e.item) then
+				sys("Test beli uid="..e.uid)
+				fireBuy(e.uid); return
+			end
+		end
+		sys("Tidak ada egg yang match mutasi aktif.")
+
+	elseif sub == "buy" then
+		local uid = parts[3]
+		if not uid then sys("Pakai: !buyegg buy <uid>"); return end
+		fireBuy(uid)
+
+	else
+		sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect")
+	end
+end
+
+if TextChatService and TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+	if TextChatService.SendingMessage then
+		TextChatService.SendingMessage:Connect(function(props)
+			if props and props.Text and props.Text:sub(1,#PREFIX)==PREFIX then
+				tryParseCommand(props.Text); props.Text=""
+			end
+		end)
+	end
+else
+	localPlayer.Chatted:Connect(tryParseCommand)
+end
+
+sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect")
