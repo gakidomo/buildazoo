@@ -1,0 +1,415 @@
+--[[
+Auto Buy Egg - Executor Version
+Spesifikasi:
+- Pantau island aktif pemain via Workspace/Art/Island_N (OccupyingPlayerId == LocalPlayer.UserId)
+- Baca eggs dari ReplicatedStorage/Eggs/Island_N
+- Atribut egg: T (type), M (mutation), ST, ET, UID
+- Rule available: ST <= now <= ET (pakai workspace:GetServerTimeNow() + grace 0.2s)
+- Filter allow-list (type & mutation). Wildcard mutasi default OFF, bisa toggle dengan !wc on/off
+- Cooldown global 1 detik. Anti-duplikat via cache UID sementara
+- Chat commands: !start, !stop, !wc on/off, !egg type <T> on/off, !egg mutation <M> on/off
+- Pembelian: ReplicatedStorage.Remote.CharacterRE:FireServer("BuyEgg", UID)
+]]
+
+-- ===== Services =====
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ===== Konstanta & State =====
+local ISLAND_COUNT = 6
+local EGGS_ROOT = ReplicatedStorage:WaitForChild("Eggs")
+local ART_ROOT = Workspace:WaitForChild("Art")
+local REMOTE = ReplicatedStorage:WaitForChild("Remote"):WaitForChild("CharacterRE")
+
+local TIME_GRACE = 0.2
+local COOLDOWN_SEC = 1.0
+
+-- Status utama (default OFF; aktif via !start)
+local running = false
+local allowEmptyMutation = false -- wildcard mutasi: default OFF
+
+-- Cache anti-duplikat UID (disimpan 2.5 detik)
+local recentlyBought = {}
+
+-- Kumpulan semua RBXScriptConnection untuk mudah disconnect saat !stop
+local connections = {}
+
+-- Listener per-egg agar bisa dicabut saat !stop atau pindah island
+local eggConnections = {}  -- [Instance] = {conn1, conn2, ...}
+
+-- Island yang sedang aktif
+local activeIslandIndex = nil
+local activeEggsFolder = nil
+
+-- ===== Util: print prefix =====
+local function log(...)
+    print("[AutoBuyEgg]", ...)
+end
+
+-- ===== Util: connections management =====
+local function trackConnection(conn)
+    table.insert(connections, conn)
+    return conn
+end
+
+local function disconnectAll(tbl)
+    for i = #tbl, 1, -1 do
+        local c = tbl[i]
+        if typeof(c) == "RBXScriptConnection" then
+            pcall(function() c:Disconnect() end)
+        elseif type(c) == "table" then
+            for j = #c, 1, -1 do
+                local cc = c[j]
+                if typeof(cc) == "RBXScriptConnection" then
+                    pcall(function() cc:Disconnect() end)
+                end
+            end
+        end
+        tbl[i] = nil
+    end
+end
+
+-- ===== Util: server time =====
+local function serverNow()
+    if Workspace.GetServerTimeNow then
+        return Workspace:GetServerTimeNow()
+    end
+    -- fallback
+    return tick()
+end
+
+-- ===== Util: read attribute safely =====
+local function getAttrNumber(inst, name)
+    local v = inst:GetAttribute(name)
+    if type(v) == "number" then return v end
+    local n = tonumber(v)
+    return n
+end
+
+local function getAttrString(inst, name)
+    local v = inst:GetAttribute(name)
+    if v == nil then return nil end
+    return tostring(v)
+end
+
+-- ===== Filter: userFilter (allow-list) =====
+-- Bisa di-override dari luar dengan typesList/mutationsList sebelum loadstring dipanggil
+local env = getfenv and getfenv() or _G
+local defaultTypes = (env and rawget(env, "typesList")) or {"EpicEgg", "LegendaryEgg"}
+local defaultMuts  = (env and rawget(env, "mutationsList")) or {}
+
+local userFilter = {
+    types = {
+        EpicEgg = true,
+        RareEgg = false,
+        LegendaryEgg = true,
+    },
+    mutations = {},
+}
+
+-- apply override arrays -> dict true
+do
+    -- Reset sesuai preferensi user (hardcoded), lalu tambahkan override array jika ada
+    userFilter.types = {}
+    for _, t in ipairs(defaultTypes) do
+        userFilter.types[t] = true
+    end
+
+    userFilter.mutations = {}
+    for _, m in ipairs(defaultMuts) do
+        userFilter.mutations[m] = true
+    end
+end
+
+-- ===== Cooldown control =====
+local cooldownBusy = false
+local function enterCooldown()
+    cooldownBusy = true
+    task.delay(COOLDOWN_SEC, function()
+        cooldownBusy = false
+    end)
+end
+
+-- ===== Anti-duplikat =====
+local function markBought(uid)
+    if not uid then return end
+    recentlyBought[uid] = true
+    task.delay(2.5, function()
+        recentlyBought[uid] = nil
+    end)
+end
+
+-- ===== Should buy? (filter + window) =====
+local function passesFilter(egg)
+    local T = getAttrString(egg, "T")
+    local M = getAttrString(egg, "M")
+    if not T then return false, "NoType" end
+
+    local typeOK = userFilter.types[T] == true
+    if not typeOK then return false, "TypeOff" end
+
+    if M == nil or M == "" then
+        -- Wildcard mutasi
+        if allowEmptyMutation then
+            return true
+        else
+            return false, "EmptyMutationBlocked"
+        end
+    else
+        local mutOK = userFilter.mutations[M] == true
+        if not mutOK then return false, "MutationOff" end
+    end
+
+    return true
+end
+
+local function inAvailabilityWindow(egg, now)
+    local ST = getAttrNumber(egg, "ST")
+    local ET = getAttrNumber(egg, "ET")
+    if not ST or not ET then
+        return false
+    end
+    -- grace
+    return (now + TIME_GRACE) >= ST and (now - TIME_GRACE) <= ET
+end
+
+-- ===== Purchase =====
+local function purchaseEgg(egg)
+    if not running then return end
+    if cooldownBusy then return end
+
+    local uid = getAttrString(egg, "UID") or egg.Name
+    if not uid or uid == "" then return end
+    if recentlyBought[uid] then return end
+
+    local now = serverNow()
+    if not inAvailabilityWindow(egg, now) then return end
+
+    local ok, reason = passesFilter(egg)
+    if not ok then return end
+
+    -- Fire server
+    local okFire, err = pcall(function()
+        REMOTE:FireServer("BuyEgg", uid)
+    end)
+
+    if okFire then
+        log(("BUY -> UID=%s [T=%s, M=%s]"):format(
+            uid,
+            tostring(egg:GetAttribute("T")),
+            tostring(egg:GetAttribute("M"))
+        ))
+        markBought(uid)
+        enterCooldown()
+    else
+        log("Buy failed:", err)
+    end
+end
+
+-- ===== Egg binding (AttributeChanged) =====
+local function unbindEgg(egg)
+    local arr = eggConnections[egg]
+    if arr then
+        disconnectAll(arr)
+        eggConnections[egg] = nil
+    end
+end
+
+local function bindEgg(egg)
+    unbindEgg(egg)
+
+    -- Evaluasi awal
+    task.defer(function()
+        if running then
+            purchaseEgg(egg)
+        end
+    end)
+
+    local arr = {}
+    table.insert(arr, egg.AttributeChanged:Connect(function(attr)
+        if not running then return end
+        if attr == "ST" or attr == "ET" or attr == "T" or attr == "M" or attr == "UID" then
+            purchaseEgg(egg)
+        end
+    end))
+    eggConnections[egg] = arr
+end
+
+-- ===== Switch island binding =====
+local function clearEggBindings()
+    for egg, _ in pairs(eggConnections) do
+        unbindEgg(egg)
+    end
+end
+
+local function bindEggsFolder(folder)
+    -- Unbind sebelumnya
+    clearEggBindings()
+    if activeEggsFolder ~= folder then
+        activeEggsFolder = folder
+    end
+    if not folder then return end
+
+    -- Bind existing
+    for _, child in ipairs(folder:GetChildren()) do
+        bindEgg(child)
+    end
+
+    -- Listen add/remove
+    table.insert(connections, folder.ChildAdded:Connect(function(inst)
+        bindEgg(inst)
+    end))
+    table.insert(connections, folder.ChildRemoved:Connect(function(inst)
+        unbindEgg(inst)
+    end))
+end
+
+-- ===== Resolve active island =====
+local function resolveIslandIndex()
+    local myId = LocalPlayer and LocalPlayer.UserId
+    if not myId then return nil end
+
+    for i = 1, ISLAND_COUNT do
+        local m = ART_ROOT:FindFirstChild(("Island_%d"):format(i))
+        if m then
+            local occ = m:GetAttribute("OccupyingPlayerId")
+            if tonumber(occ) == myId then
+                return i
+            end
+        end
+    end
+    return nil
+end
+
+local function rebindToActiveIsland()
+    local idx = resolveIslandIndex()
+    if idx ~= activeIslandIndex then
+        activeIslandIndex = idx
+        if idx then
+            local folder = EGGS_ROOT:FindFirstChild(("Island_%d"):format(idx))
+            log("Active island ->", idx, folder and "[eggs found]" or "[no eggs folder]")
+            bindEggsFolder(folder)
+        else
+            log("Active island -> none")
+            bindEggsFolder(nil)
+        end
+    end
+end
+
+-- Listen semua Island_* untuk perubahan OccupyingPlayerId
+local function bindIslandWatchers()
+    -- Pertama kali evaluasi
+    rebindToActiveIsland()
+
+    for i = 1, ISLAND_COUNT do
+        local model = ART_ROOT:FindFirstChild(("Island_%d"):format(i))
+        if model then
+            table.insert(connections, model.AttributeChanged:Connect(function(attr)
+                if attr == "OccupyingPlayerId" then
+                    rebindToActiveIsland()
+                end
+            end))
+        end
+    end
+end
+
+-- ===== START / STOP =====
+local function stopScript()
+    if not running then
+        log("Already stopped.")
+        return
+    end
+    running = false
+    disconnectAll(connections)
+    clearEggBindings()
+    connections = {}
+    activeEggsFolder = nil
+    log("Stopped. All listeners disconnected.")
+end
+
+local function startScript()
+    if running then
+        log("Already running.")
+        return
+    end
+    running = true
+    -- Setup watchers
+    bindIslandWatchers()
+
+    -- Periodic recheck (cadangan, jaga-jaga jika ada kondisi telat replikasi)
+    table.insert(connections, task.spawn(function()
+        while running do
+            rebindToActiveIsland()
+            task.wait(2.0)
+        end
+    end))
+
+    log("Started. Listening for eggs on your active island...")
+end
+
+-- ===== Chat Commands =====
+local function handleChat(msg)
+    msg = tostring(msg)
+    local low = msg:lower()
+
+    -- !start / !stop
+    if low == "!start" then
+        startScript()
+        return
+    elseif low == "!stop" then
+        stopScript()
+        return
+    end
+
+    -- !wc on/off
+    do
+        local cmd, state = low:match("^!wc%s+(on|off)$")
+        if cmd and state then
+            allowEmptyMutation = (state == "on")
+            log("Wildcard mutation:", allowEmptyMutation and "ON" or "OFF")
+            return
+        end
+    end
+
+    -- !egg type <T> on/off
+    do
+        local kind, name, state = low:match("^!egg%s+(type)%s+(%S+)%s+(on|off)$")
+        if kind and name and state then
+            -- Gunakan nama persis (case-sensitive) sesuai attribute T
+            -- Kita ambil original token dari msg untuk menjaga kapitalisasi
+            local _, _, _, rawName, rawState = msg:find("^!egg%s+(type)%s+(%S+)%s+(on|off)$")
+            if rawName and rawState then
+                userFilter.types[rawName] = (rawState:lower() == "on")
+                log(("Type '%s' => %s"):format(rawName, userFilter.types[rawName] and "ON" or "OFF"))
+            end
+            return
+        end
+    end
+
+    -- !egg mutation <M> on/off
+    do
+        local kind, name, state = low:match("^!egg%s+(mutation)%s+(%S+)%s+(on|off)$")
+        if kind and name and state then
+            local _, _, _, rawName, rawState = msg:find("^!egg%s+(mutation)%s+(%S+)%s+(on|off)$")
+            if rawName and rawState then
+                userFilter.mutations[rawName] = (rawState:lower() == "on")
+                log(("Mutation '%s' => %s"):format(rawName, userFilter.mutations[rawName] and "ON" or "OFF"))
+            end
+            return
+        end
+    end
+end
+
+-- Hook chat
+local chatConn = LocalPlayer.Chatted:Connect(handleChat)
+trackConnection(chatConn)
+
+-- ===== Info awal =====
+log("Loaded. Status: STOPPED (use !start). Wildcard mutation: OFF")
+log("Commands: !start, !stop, !wc on/off, !egg type <T> on/off, !egg mutation <M> on/off")
+
+-- (opsional) kalau mau auto-start saat load, uncomment:
+-- startScript()
