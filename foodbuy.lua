@@ -15,14 +15,15 @@ local WHITELIST = { -- set true untuk item yang mau dibeli
     Durian = true,
 	CandyCorn = true,
 	Pumpkin = true,
+	FrankenKiwi = true,
 }
 
 local LOOP_ENABLED = true              -- true = jalan terus
-local LOOP_INTERVAL = 220              -- detik
+local LOOP_INTERVAL = 145              -- detik
 local DELAY_PER_BUY = 0.25             -- jeda antar FireServer
 local MAX_PER_ITEM = 500               -- safe guard
 local DRY_RUN = false                  -- true = simulasi aja (tidak FireServer)
-local TOAST_DURATION = 10              -- detik
+local TOAST_DURATION = 5              -- detik
 
 -------------------------
 -- ========== SERVICE & PATH ==========
