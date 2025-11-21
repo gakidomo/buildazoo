@@ -703,6 +703,14 @@ local function tryParseCommand(msg)
 			persistState()
 		end
 
+	elseif sub == "unload" then
+    	running = false
+    	clearConns()
+    	overlay.enabled = false
+    	destroyOverlay()
+    	sys("AutoEgg dihentikan dan semua event listener dilepas.")
+    return
+
 	elseif sub == "types" then
     if not activeIsland or not activeBelt then
         sys("Belt belum aktif. Gunakan !buyegg rescan dulu.")
@@ -856,7 +864,7 @@ local function tryParseCommand(msg)
 		fireBuy(uid)
 
 	else
-		sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | overlay")
+		sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | overlay | unload")
 	end
 
 	-- Persist state ringan di akhir command
