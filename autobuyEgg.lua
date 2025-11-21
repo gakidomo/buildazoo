@@ -704,31 +704,56 @@ local function tryParseCommand(msg)
 		end
 
 	elseif sub == "types" then
-		if not activeIsland or not activeBelt then
-			sys("Belt belum aktif. Gunakan !buyegg rescan dulu.")
-		else
-			local counts = {}
-			for e in iterValidEggs(activeIsland, activeBelt) do
-				local et = getEggType(e.data, e.item)
-				if et then
-					local key = _norm(et)
-					if not counts[key] then counts[key] = {name = et, n = 0} end
-					counts[key].n += 1
-				end
-			end
-			local total = 0
-			for _, v in pairs(counts) do total += v.n end
-			if total == 0 then
-				sys("Tidak ada egg type terdeteksi di belt saat ini.")
-			else
-				sys(("Egg types di belt (total %d):"):format(total))
-				for _, v in pairs(counts) do
-					local flag = TYPE_ALLOW[_norm(v.name)] and "ON" or "off"
-					sys(("- %s  (count=%d, filter=%s)"):format(v.name, v.n, flag))
-					task.wait(0.02)
-				end
-			end
-		end
+    if not activeIsland or not activeBelt then
+        sys("Belt belum aktif. Gunakan !buyegg rescan dulu.")
+    else
+        local counts = {} -- counts[typeKey] = { name = typeName, n = 0, muts = { mutKey = { name = mutName, n = 0 } } }
+        local total = 0
+
+        for e in iterValidEggs(activeIsland, activeBelt) do
+            local et = getEggType(e.data, e.item) or "(unknown)"
+            local mk = tostring(e.data:GetAttribute("M") or "(none)")
+            local tkey = _norm(et)
+            local mkey = _norm(mk)
+
+            if not counts[tkey] then
+                counts[tkey] = { name = et, n = 0, muts = {} }
+            end
+            counts[tkey].n = counts[tkey].n + 1
+            total = total + 1
+
+            if not counts[tkey].muts[mkey] then
+                counts[tkey].muts[mkey] = { name = mk, n = 0 }
+            end
+            counts[tkey].muts[mkey].n = counts[tkey].muts[mkey].n + 1
+        end
+
+        if total == 0 then
+            sys("Tidak ada egg type terdeteksi di belt saat ini.")
+        else
+            sys(("Egg types di belt (total %d):"):format(total))
+            -- urut berdasarkan nama tipe untuk konsistensi
+            local keys = {}
+            for k,_ in pairs(counts) do keys[#keys+1] = k end
+            table.sort(keys)
+
+            for _, k in ipairs(keys) do
+                local v = counts[k]
+                local flag = TYPE_ALLOW[_norm(v.name)] and "ON" or "off"
+                sys(("- %s  (count=%d, filter=%s)"):format(v.name, v.n, flag))
+                task.wait(0.01)
+                -- tampilkan mutasi untuk tipe ini (urut)
+                local mkeys = {}
+                for mk,_ in pairs(v.muts) do mkeys[#mkeys+1] = mk end
+                table.sort(mkeys)
+                for _, mk in ipairs(mkeys) do
+                    local mv = v.muts[mk]
+                    sys(("    * %s (count=%d)"):format(mv.name, mv.n))
+                    task.wait(0.01)
+                end
+            end
+        end
+    end
 
 	elseif sub == "settype" then
 		-- !buyegg settype <TypeName> on|off
