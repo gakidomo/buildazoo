@@ -16,6 +16,8 @@ local WHITELIST = { -- set true untuk item yang mau dibeli
 	CandyCorn = true,
 	Pumpkin = true,
 	FrankenKiwi = true,
+	Acorn = true,
+	Cranberry = true
 }
 
 local LOOP_ENABLED = true              -- true = jalan terus
