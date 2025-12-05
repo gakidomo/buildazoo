@@ -1,3 +1,4 @@
 loadstring(game:HttpGet("linkrawgithub"))()
 
-loadstring(game:HttpGet(""))()
+autobuy food:
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/refs/heads/main/foodbuy.lua"))()
