@@ -5,7 +5,7 @@
 -- =======================[ KONFIGURASI AWAL (DEFAULT) ]=======================
 
 local ISLAND_PARENT_NAME = "Art"
-local DESIRED_MUTATIONS = { Golden = false, Dino = false, Snow = true, Halloween = true } -- default sama seperti skripmu
+local DESIRED_MUTATIONS = { Golden = false, Dino = false, Snow = false, Halloween = false, Thanksgiving = true } -- default sama seperti skripmu
 local CONVEYOR_LEVEL_OVERRIDE = nil
 
 local BUY_COOLDOWN_SEC = 0.35
