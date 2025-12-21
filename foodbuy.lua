@@ -2,22 +2,22 @@
 -------------------------
 -- ========== KONFIGURASI ==========
 -------------------------
-local USE_WHITELIST = true
-local WHITELIST = { -- set true untuk item yang mau dibeli
+local USE_BLACKLIST = true
+local BLACKLIST = { -- set true untuk item yang TIDAK mau dibeli
     --Pear = true,
 	--Pineapple = true,
 	--DragonFruit = true,
 	--GoldMango = true,
 	--BloodstoneCycad = true,
-	ColossalPinecone = true,
-	VoltGinkgo = true,
-	DeepseaPearlFruit = true,
-    Durian = true,
-	CandyCorn = true,
-	Pumpkin = true,
-	FrankenKiwi = true,
-	Acorn = true,
-	Cranberry = true,
+	--ColossalPinecone = true,
+	--VoltGinkgo = true,
+	--DeepseaPearlFruit = true,
+    --Durian = true,
+	--CandyCorn = true,
+	--Pumpkin = true,
+	--FrankenKiwi = true,
+	--Acorn = true,
+	--Cranberry = true,
 }
 
 local LOOP_ENABLED = true              -- true = jalan terus
@@ -135,7 +135,7 @@ local function buildTargetsFromAttributes(lstInstance)
     for name, qty in pairs(attrs) do
         local isNumber = (typeof(qty) == "number")
         if isNumber and qty > 0 then
-            if (not USE_WHITELIST) or (USE_WHITELIST and WHITELIST[name] == true) then
+            if (not USE_BLACKLIST) or (BLACKLIST[name] ~= true) then
                 targets[name] = clamp(qty, 1, MAX_PER_ITEM)
             end
         end
@@ -155,12 +155,12 @@ local function buyOnce()
     }
 
     local targets = buildTargetsFromAttributes(lst)
-    -- catat item yang diskip karena whitelist/qty 0
+    -- catat item yang diskip karena blacklist/qty 0
     do
         local attrs = lst:GetAttributes()
         for name, qty in pairs(attrs) do
             if (typeof(qty) == "number") and qty > 0 then
-                if USE_WHITELIST and WHITELIST[name] ~= true then
+                if USE_BLACKLIST and BLACKLIST[name] == true then
                     summary.skipped[name] = qty
                 end
             end
