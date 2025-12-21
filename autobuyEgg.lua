@@ -1,6 +1,6 @@
--- AutoEgg UNC-Integrated (Ronix) — v1.0
--- Fokus: Filesystem (persist), rconsole (observabilitas), event-driven, overlay (Drawing), guardrail+backoff.
--- Catatan: Tidak memakai WebSocket. Jalur utama tetap RPC FireServer("BuyEgg", uid).
+-- AutoEgg UNC-Integrated (Ronix) — v2.0
+-- Fokus: In-memory state, rconsole (observabilitas), event-driven, overlay (Drawing), guardrail+backoff.
+-- Catatan: Tidak memakai WebSocket atau file I/O. Jalur utama tetap RPC FireServer("BuyEgg", uid).
 
 -- =======================[ KONFIGURASI AWAL (DEFAULT) ]=======================
 
@@ -31,9 +31,6 @@ local OVERLAY_FONT = 2          -- Drawing.Fonts.UI (umum)
 local OVERLAY_TEXT_SIZE = 16
 local OVERLAY_BG_ALPHA = 0.4
 
--- Logs
-local LOG_ROTATE_BYTES = 1 * 1024 * 1024 -- 1MB
-
 -- Backoff
 local BACKOFF_FAIL_COUNT = 3
 local BACKOFF_DURATION = 2.0
@@ -51,17 +48,6 @@ local HttpService = game:GetService("HttpService")
 local localPlayer = Players.LocalPlayer
 local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
 local root = character:WaitForChild("HumanoidRootPart")
-
--- UNC Filesystem (pastikan tersedia di Ronix-mu)
-local isfile = isfile or function() return false end
-local isfolder = isfolder or function() return false end
-local writefile = writefile or function() end
-local readfile = readfile or function() return nil end
-local appendfile = appendfile or function() end
-local makefolder = makefolder or function() end
-local delfile = delfile or function() end
-local delfolder = delfolder or function() end
-local listfiles = listfiles -- opsional (tidak wajib)
 
 -- rconsole (pakai keluarga rconsole* bila tersedia)
 local HAS_RCONSOLE = (typeof(rconsoleprint) == "function") or (typeof(rconsolewarn) == "function")
@@ -83,76 +69,6 @@ local function sys(t)
 	pcall(function() StarterGui:SetCore("ChatMakeSystemMessage",{Text="[AutoEgg] "..t}) end)
 	if ENABLE_LOG then print("[AutoEgg]", t) end
 	rlog("INFO", t)
-end
-
--- ===============================[ PERSISTENSI ]==============================
-
-local DIR = ".autoegg"
-local PATH_CONFIG = DIR.."/config.json"
-local PATH_STATE  = DIR.."/state.json"
-local PATH_LOG    = DIR.."/logs.txt"
-
-local function ensureDir()
-	if not isfolder(DIR) then
-		makefolder(DIR)
-	end
-end
-
-local function jsonEncode(tbl)
-	return HttpService:JSONEncode(tbl)
-end
-local function jsonDecode(s)
-	return HttpService:JSONDecode(s)
-end
-
-local function safeWrite(path, content)
-	-- tulis ke tmp lalu ganti (rename emulasi: hapus lama -> tulis baru)
-	local tmp = path..".tmp"
-	writefile(tmp, content)
-	if isfile(path) then
-		delfile(path)
-	end
-	writefile(path, content)
-	if isfile(tmp) then
-		delfile(tmp)
-	end
-end
-
-local function readJson(path, fallback)
-	if not isfile(path) then return fallback end
-	local ok, data = pcall(readfile, path)
-	if not ok or not data or #data == 0 then return fallback end
-	local ok2, obj = pcall(jsonDecode, data)
-	if not ok2 then return fallback end
-	return obj
-end
-
-local function writeJson(path, obj)
-	local ok, data = pcall(jsonEncode, obj)
-	if ok then
-		safeWrite(path, data)
-	end
-end
-
-local function rotateLogIfNeeded()
-	if not isfile(PATH_LOG) then return end
-	local ok, data = pcall(readfile, PATH_LOG)
-	if not ok or not data then return end
-	if #data >= LOG_ROTATE_BYTES then
-		local stamp = os.date("!%Y%m%d-%H%M%S")
-		local rotated = string.format("%s/logs-%s.txt", DIR, stamp)
-		-- pindahkan konten lama ke file baru, kosongkan logs.txt
-		writefile(rotated, data)
-		delfile(PATH_LOG)
-		writefile(PATH_LOG, "")
-		rlog("WARN", "Log dirotasi ke "..rotated)
-	end
-end
-
-local function logLine(msg)
-	ensureDir()
-	rotateLogIfNeeded()
-	appendfile(PATH_LOG, string.format("%s %s\n", os.date("!%Y-%m-%dT%H:%M:%SZ"), msg))
 end
 
 -- ===============================[ STATE RUNTIME ]============================
@@ -438,16 +354,15 @@ local function fireBuy(uid)
 	if ok then
 		recordBuy(uid)
 		consecutiveFail = 0
-		logLine(("BUY OK uid=%s"):format(uid))
 		if ENABLE_LOG then
 			print(("[AutoEgg] BUY uid=%s"):format(uid))
 		end
+		rlog("INFO", ("BUY OK uid=%s"):format(uid))
 		task.wait(BUY_COOLDOWN_SEC)
 		return true
 	else
 		consecutiveFail += 1
-		logLine(("BUY FAIL uid=%s err=%s"):format(uid, tostring(err)))
-		rlog("WARN", "FireServer gagal: "..tostring(err))
+		rlog("WARN", ("BUY FAIL uid=%s err=%s"):format(uid, tostring(err)))
 		if consecutiveFail >= BACKOFF_FAIL_COUNT then
 			backoffUntil = os.clock() + BACKOFF_DURATION
 			rlog("WARN", ("Backoff aktif %0.1fs"):format(BACKOFF_DURATION))
@@ -483,7 +398,7 @@ local function rescanAll(reason)
 
 	activeIsland, activeConveyor, activeBelt = island, conveyor, belt
 	sys(("Rescan (%s): ✅ %s → %s (Belt children: %d)"):format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
-	logLine(("RESCAN %s %s %s cnt=%d"):format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
+	rlog("INFO", ("RESCAN %s %s %s cnt=%d"):format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
 
 	-- Pasang Event-Driven listener pada Belt
 	local c1 = belt.ChildAdded:Connect(function(child)
@@ -584,49 +499,6 @@ end
 
 -- ===============================[ BOOTSTRAP ]================================
 
-ensureDir()
-
--- Load CONFIG & STATE
-do
-	-- Config
-	local cfg = readJson(PATH_CONFIG, nil)
-	if cfg then
-		-- override nilai default jika ada
-		if cfg.ISLAND_PARENT_NAME then ISLAND_PARENT_NAME = cfg.ISLAND_PARENT_NAME end
-		if cfg.DESIRED_MUTATIONS then DESIRED_MUTATIONS = cfg.DESIRED_MUTATIONS end
-		if cfg.CONVEYOR_LEVEL_OVERRIDE ~= nil then CONVEYOR_LEVEL_OVERRIDE = cfg.CONVEYOR_LEVEL_OVERRIDE end
-		if cfg.BUY_COOLDOWN_SEC then BUY_COOLDOWN_SEC = cfg.BUY_COOLDOWN_SEC end
-		if cfg.RESCAN_INTERVAL_SEC then RESCAN_INTERVAL_SEC = cfg.RESCAN_INTERVAL_SEC end
-		if cfg.MAX_BUYS_PER_MIN then MAX_BUYS_PER_MIN = cfg.MAX_BUYS_PER_MIN end
-		if cfg.LAST_BOUGHT_TTL_SEC then LAST_BOUGHT_TTL_SEC = cfg.LAST_BOUGHT_TTL_SEC end
-		if cfg.ENABLE_LOG ~= nil then ENABLE_LOG = cfg.ENABLE_LOG end
-		if cfg.ENABLE_TYPE_FILTER ~= nil then ENABLE_TYPE_FILTER = cfg.ENABLE_TYPE_FILTER end
-		if cfg.TYPE_ALLOW then TYPE_ALLOW = cfg.TYPE_ALLOW end
-	end
-
-	-- State
-	local st = readJson(PATH_STATE, nil)
-	if st then
-		if st.lastBoughtAt then lastBoughtAt = st.lastBoughtAt end
-	end
-end
-
--- Tulis default config jika belum ada
-if not isfile(PATH_CONFIG) then
-	writeJson(PATH_CONFIG, {
-		ISLAND_PARENT_NAME = ISLAND_PARENT_NAME,
-		DESIRED_MUTATIONS = DESIRED_MUTATIONS,
-		CONVEYOR_LEVEL_OVERRIDE = CONVEYOR_LEVEL_OVERRIDE,
-		BUY_COOLDOWN_SEC = BUY_COOLDOWN_SEC,
-		RESCAN_INTERVAL_SEC = RESCAN_INTERVAL_SEC,
-		MAX_BUYS_PER_MIN = MAX_BUYS_PER_MIN,
-		LAST_BOUGHT_TTL_SEC = LAST_BOUGHT_TTL_SEC,
-		ENABLE_LOG = ENABLE_LOG,
-		ENABLE_TYPE_FILTER = ENABLE_TYPE_FILTER,
-		TYPE_ALLOW = TYPE_ALLOW,
-	})
-end
-
 -- Rescan awal
 task.defer(function()
 	rescanAll("initial")
@@ -645,30 +517,6 @@ local function listActiveMutations()
 	local t = {}
 	for k,v in pairs(DESIRED_MUTATIONS) do if v then t[#t+1]=k end end
 	table.sort(t); return #t>0 and table.concat(t,", ") or "(kosong)"
-end
-
-local function persistConfig()
-	writeJson(PATH_CONFIG, {
-		ISLAND_PARENT_NAME = ISLAND_PARENT_NAME,
-		DESIRED_MUTATIONS = DESIRED_MUTATIONS,
-		CONVEYOR_LEVEL_OVERRIDE = CONVEYOR_LEVEL_OVERRIDE,
-		BUY_COOLDOWN_SEC = BUY_COOLDOWN_SEC,
-		RESCAN_INTERVAL_SEC = RESCAN_INTERVAL_SEC,
-		MAX_BUYS_PER_MIN = MAX_BUYS_PER_MIN,
-		LAST_BOUGHT_TTL_SEC = LAST_BOUGHT_TTL_SEC,
-		ENABLE_LOG = ENABLE_LOG,
-		ENABLE_TYPE_FILTER = ENABLE_TYPE_FILTER,
-		TYPE_ALLOW = TYPE_ALLOW,
-	})
-end
-
-local function persistState()
-	writeJson(PATH_STATE, {
-		lastBoughtAt = lastBoughtAt,
-		island = activeIsland and activeIsland.Name or nil,
-		conveyor = activeConveyor and activeConveyor.Name or nil,
-		beltCount = (activeBelt and #activeBelt:GetChildren() or 0),
-	})
 end
 
 local function tryParseCommand(msg)
@@ -699,8 +547,6 @@ local function tryParseCommand(msg)
 		local ok = rescanAll("manual")
 		if not ok then
 			sys("Rescan gagal. Pastikan kamu berada di dekat island & conveyor yang benar.")
-		else
-			persistState()
 		end
 
 	elseif sub == "unload" then
@@ -771,7 +617,6 @@ local function tryParseCommand(msg)
 			sys("Pakai: !buyegg settype <TypeName> on|off   (contoh: !buyegg settype BowserEgg on)")
 		else
 			TYPE_ALLOW[_norm(name)] = (onoff == "on")
-			persistConfig()
 			sys(("Filter type %s: %s"):format(name, onoff == "on" and "ON" or "off"))
 			renderOverlay()
 		end
@@ -786,14 +631,12 @@ local function tryParseCommand(msg)
 			for token in string.gmatch(list, "([^,]+)") do
 				TYPE_ALLOW[_norm((token:gsub("^%s*(.-)%s*$","%1")))] = true
 			end
-			persistConfig()
 			sys("Filter types di-set eksklusif. Cek dengan !buyegg types")
 			renderOverlay()
 		end
 
 	elseif sub == "cleartypes" then
 		for k,_ in pairs(TYPE_ALLOW) do TYPE_ALLOW[k] = nil end
-		persistConfig()
 		sys("Filter types dikosongkan (semua tipe diizinkan).")
 		renderOverlay()
 
@@ -821,13 +664,11 @@ local function tryParseCommand(msg)
 		local p = parts[3]
 		if p == nil or p == "auto" then
 			CONVEYOR_LEVEL_OVERRIDE = nil
-			persistConfig()
 			sys("Conveyor level: AUTO")
 		else
 			local n = tonumber(p)
 			if n then
 				CONVEYOR_LEVEL_OVERRIDE = n
-				persistConfig()
 				sys("Conveyor level di-set ke: "..n)
 			else
 				sys("Pakai: !buyegg setlevel <n|auto>")
@@ -842,7 +683,6 @@ local function tryParseCommand(msg)
 			return
 		end
 		DESIRED_MUTATIONS[name] = (onoff == "on")
-		persistConfig()
 		sys("Mutasi aktif sekarang: "..listActiveMutations())
 		renderOverlay()
 
@@ -866,9 +706,6 @@ local function tryParseCommand(msg)
 	else
 		sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | overlay | unload")
 	end
-
-	-- Persist state ringan di akhir command
-	persistState()
 end
 
 if TextChatService and TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
