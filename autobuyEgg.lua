@@ -1,6 +1,6 @@
--- AutoEgg UNC-Integrated (Ronix) — v1.0
--- Fokus: Filesystem (persist), rconsole (observabilitas), event-driven, overlay (Drawing), guardrail+backoff.
--- Catatan: Tidak memakai WebSocket. Jalur utama tetap RPC FireServer("BuyEgg", uid).
+-- AutoEgg UNC-Integrated (Ronix) — v2.0
+-- Fokus: In-memory state, rconsole (observabilitas), event-driven, overlay (Drawing), guardrail+backoff.
+-- Catatan: Tidak memakai WebSocket atau file I/O. Jalur utama tetap RPC FireServer("BuyEgg", uid).
 
 -- =======================[ KONFIGURASI AWAL (DEFAULT) ]=======================
 
@@ -22,17 +22,11 @@ local COLLECT_MAX_PETS = nil
 local ENABLE_TYPE_FILTER = true
 local TYPE_ALLOW = {}
 
--- Overlay
-local OVERLAY_AUTOSHOW = true   -- otomatis on saat start (sesuai permintaan)
-local OVERLAY_MARGIN = 10       -- padding tepi layar
-local OVERLAY_PADDING = 10
-local OVERLAY_LINE_SPACING = 16 -- spasi antar baris teks
-local OVERLAY_FONT = 2          -- Drawing.Fonts.UI (umum)
-local OVERLAY_TEXT_SIZE = 16
-local OVERLAY_BG_ALPHA = 0.4
-
--- Logs
-local LOG_ROTATE_BYTES = 1 * 1024 * 1024 -- 1MB
+-- Simple Display
+local DISPLAY_ENABLED = true
+local DISPLAY_FONT = 2
+local DISPLAY_TEXT_SIZE = 14
+local DISPLAY_POSITION = Vector2.new(10, 10)
 
 -- Backoff
 local BACKOFF_FAIL_COUNT = 3
@@ -45,23 +39,11 @@ local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
 local TextChatService = game:GetService("TextChatService")
-local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 
 local localPlayer = Players.LocalPlayer
 local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
 local root = character:WaitForChild("HumanoidRootPart")
-
--- UNC Filesystem (pastikan tersedia di Ronix-mu)
-local isfile = isfile or function() return false end
-local isfolder = isfolder or function() return false end
-local writefile = writefile or function() end
-local readfile = readfile or function() return nil end
-local appendfile = appendfile or function() end
-local makefolder = makefolder or function() end
-local delfile = delfile or function() end
-local delfolder = delfolder or function() end
-local listfiles = listfiles -- opsional (tidak wajib)
 
 -- rconsole (pakai keluarga rconsole* bila tersedia)
 local HAS_RCONSOLE = (typeof(rconsoleprint) == "function") or (typeof(rconsolewarn) == "function")
@@ -83,76 +65,6 @@ local function sys(t)
 	pcall(function() StarterGui:SetCore("ChatMakeSystemMessage",{Text="[AutoEgg] "..t}) end)
 	if ENABLE_LOG then print("[AutoEgg]", t) end
 	rlog("INFO", t)
-end
-
--- ===============================[ PERSISTENSI ]==============================
-
-local DIR = ".autoegg"
-local PATH_CONFIG = DIR.."/config.json"
-local PATH_STATE  = DIR.."/state.json"
-local PATH_LOG    = DIR.."/logs.txt"
-
-local function ensureDir()
-	if not isfolder(DIR) then
-		makefolder(DIR)
-	end
-end
-
-local function jsonEncode(tbl)
-	return HttpService:JSONEncode(tbl)
-end
-local function jsonDecode(s)
-	return HttpService:JSONDecode(s)
-end
-
-local function safeWrite(path, content)
-	-- tulis ke tmp lalu ganti (rename emulasi: hapus lama -> tulis baru)
-	local tmp = path..".tmp"
-	writefile(tmp, content)
-	if isfile(path) then
-		delfile(path)
-	end
-	writefile(path, content)
-	if isfile(tmp) then
-		delfile(tmp)
-	end
-end
-
-local function readJson(path, fallback)
-	if not isfile(path) then return fallback end
-	local ok, data = pcall(readfile, path)
-	if not ok or not data or #data == 0 then return fallback end
-	local ok2, obj = pcall(jsonDecode, data)
-	if not ok2 then return fallback end
-	return obj
-end
-
-local function writeJson(path, obj)
-	local ok, data = pcall(jsonEncode, obj)
-	if ok then
-		safeWrite(path, data)
-	end
-end
-
-local function rotateLogIfNeeded()
-	if not isfile(PATH_LOG) then return end
-	local ok, data = pcall(readfile, PATH_LOG)
-	if not ok or not data then return end
-	if #data >= LOG_ROTATE_BYTES then
-		local stamp = os.date("!%Y%m%d-%H%M%S")
-		local rotated = string.format("%s/logs-%s.txt", DIR, stamp)
-		-- pindahkan konten lama ke file baru, kosongkan logs.txt
-		writefile(rotated, data)
-		delfile(PATH_LOG)
-		writefile(PATH_LOG, "")
-		rlog("WARN", "Log dirotasi ke "..rotated)
-	end
-end
-
-local function logLine(msg)
-	ensureDir()
-	rotateLogIfNeeded()
-	appendfile(PATH_LOG, string.format("%s %s\n", os.date("!%Y-%m-%dT%H:%M:%SZ"), msg))
 end
 
 -- ===============================[ STATE RUNTIME ]============================
@@ -178,127 +90,55 @@ local function clearConns()
 	end
 end
 
--- =============================[ OVERLAY (Drawing) ]==========================
+-- =============================[ SIMPLE DISPLAY ]============================
 
-local overlay = {
-	enabled = OVERLAY_AUTOSHOW,
-	objects = {},
-	bounds = {x=0,y=0,w=0,h=0},
-	closeBtn = {x=0,y=0,w=20,h=20}, -- area tombol [X]
-}
+local displayText = nil
 
-local function destroyOverlay()
-	for _,o in pairs(overlay.objects) do
-		pcall(function() o.Visible = false; o:Remove() end)
+local function destroyDisplay()
+	if displayText then
+		pcall(function() displayText.Visible = false; displayText:Remove() end)
+		displayText = nil
 	end
-	overlay.objects = {}
 end
 
-local function drawRect(x,y,w,h, alpha)
-	local r = Drawing.new("Square")
-	r.Filled = true
-	r.Color = Color3.new(0,0,0)
-	r.Transparency = alpha or OVERLAY_BG_ALPHA
-	r.Size = Vector2.new(w, h)
-	r.Position = Vector2.new(x, y)
-	r.Visible = true
-	return r
-end
-
-local function drawText(x,y,txt,size)
-	local t = Drawing.new("Text")
-	t.Text = txt
-	t.Size = size or OVERLAY_TEXT_SIZE
-	t.Font = OVERLAY_FONT
-	t.Color = Color3.new(1,1,1)
-	t.Position = Vector2.new(x, y)
-	t.Visible = true
-	return t
-end
-
-local function within(px,py, r)
-	return px >= r.x and px <= r.x + r.w and py >= r.y and py <= r.y + r.h
-end
-
-local function renderOverlay()
-	if not overlay.enabled then destroyOverlay(); return end
-	destroyOverlay()
-
-	-- Kumpulkan info status ringkas
-	local modeExec = "RPC"
-	local modeDetect = (activeBelt and "#evt" or "polling") -- kita pasang event saat belt siap
+local function updateDisplay()
+	if not DISPLAY_ENABLED then
+		destroyDisplay()
+		return
+	end
+	
+	-- Kumpulkan mutations aktif
 	local mutList = {}
-	for k,v in pairs(DESIRED_MUTATIONS) do if v then mutList[#mutList+1]=k end end
+	for k,v in pairs(DESIRED_MUTATIONS) do
+		if v then mutList[#mutList+1]=k end
+	end
 	table.sort(mutList)
 	local mutStr = (#mutList>0) and table.concat(mutList,", ") or "(none)"
-
+	
+	-- Kumpulkan types aktif
 	local allowTypes = {}
-	for k,v in pairs(TYPE_ALLOW) do if v then allowTypes[#allowTypes+1]=k end end
+	for k,v in pairs(TYPE_ALLOW) do
+		if v then allowTypes[#allowTypes+1]=k end
+	end
 	table.sort(allowTypes)
 	local typeStr = (#allowTypes>0) and table.concat(allowTypes,", ") or "(all)"
-
-	local lines = {
-		"AutoEgg UNC Status",
-		string.format("Mode Exec : %s", modeExec),
-		string.format("Detection : %s + polling", (activeBelt and "event-driven" or "no-events")),
-		string.format("Island    : %s", activeIsland and activeIsland.Name or "-"),
-		string.format("Conveyor  : %s", activeConveyor and activeConveyor.Name or "-"),
-		string.format("Buys/min  : %d / %d", #buysWindow, MAX_BUYS_PER_MIN),
-		string.format("TTL(UID)  : %0.1fs", LAST_BOUGHT_TTL_SEC),
-		string.format("Mutations : %s", mutStr),
-		string.format("Types     : %s", typeStr),
-		"[X] close overlay",
-	}
-
-	-- Hitung ukuran sederhana
-	local maxw = 0
-	for _,txt in ipairs(lines) do
-		maxw = math.max(maxw, #txt)
+	
+	-- Buat text sederhana
+	local displayStr = string.format("[AutoEgg] Mutations: %s | Types: %s", mutStr, typeStr)
+	
+	if not displayText then
+		displayText = Drawing.new("Text")
+		displayText.Size = DISPLAY_TEXT_SIZE
+		displayText.Font = DISPLAY_FONT
+		displayText.Color = Color3.new(1, 1, 1)
+		displayText.Position = DISPLAY_POSITION
+		displayText.Visible = true
+		displayText.Outline = true
+		displayText.OutlineColor = Color3.new(0, 0, 0)
 	end
-	local w = math.max(240, maxw*8 + 30)
-	local h = OVERLAY_MARGIN*2 + (#lines)*OVERLAY_LINE_SPACING + 10
-	local x = OVERLAY_MARGIN
-	local y = OVERLAY_MARGIN
-
-	overlay.bounds = {x=x,y=y,w=w,h=h}
-	overlay.closeBtn = {x = x + w - 26, y = y + 6, w = 20, h = 20}
-
-	-- Background
-	overlay.objects.bg = drawRect(x, y, w, h, OVERLAY_BG_ALPHA)
-
-	-- Teks
-	local ty = y + 10
-	for i,txt in ipairs(lines) do
-		local t = drawText(x+10, ty, txt, OVERLAY_TEXT_SIZE)
-		overlay.objects["t"..i] = t
-		ty = ty + OVERLAY_LINE_SPACING
-	end
-
-	-- Kotak tombol [X]
-	overlay.objects.btn = drawRect(overlay.closeBtn.x, overlay.closeBtn.y, overlay.closeBtn.w, overlay.closeBtn.h, 0.25)
-	overlay.objects.btnBorder = Drawing.new("Square")
-	overlay.objects.btnBorder.Filled = false
-	overlay.objects.btnBorder.Color = Color3.new(1,1,1)
-	overlay.objects.btnBorder.Size = Vector2.new(overlay.closeBtn.w, overlay.closeBtn.h)
-	overlay.objects.btnBorder.Position = Vector2.new(overlay.closeBtn.x, overlay.closeBtn.y)
-	overlay.objects.btnBorder.Visible = true
-
-	local tx = drawText(overlay.closeBtn.x+5, overlay.closeBtn.y+2, "X", OVERLAY_TEXT_SIZE)
-	overlay.objects.btnText = tx
+	
+	displayText.Text = displayStr
 end
-
--- Tutup overlay saat klik mouse di area tombol
-UserInputService.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-	if input.UserInputType == Enum.UserInputType.MouseButton1 and overlay.enabled then
-		local pos = UserInputService:GetMouseLocation()
-		if within(pos.X, pos.Y, overlay.closeBtn) then
-			overlay.enabled = false
-			destroyOverlay()
-			sys("Overlay ditutup. Ketik !buyegg overlay untuk menampilkan kembali.")
-		end
-	end
-end)
 
 -- =============================[ LOGIKA GAME ]================================
 
@@ -438,16 +278,15 @@ local function fireBuy(uid)
 	if ok then
 		recordBuy(uid)
 		consecutiveFail = 0
-		logLine(("BUY OK uid=%s"):format(uid))
 		if ENABLE_LOG then
 			print(("[AutoEgg] BUY uid=%s"):format(uid))
 		end
+		rlog("INFO", ("BUY OK uid=%s"):format(uid))
 		task.wait(BUY_COOLDOWN_SEC)
 		return true
 	else
 		consecutiveFail += 1
-		logLine(("BUY FAIL uid=%s err=%s"):format(uid, tostring(err)))
-		rlog("WARN", "FireServer gagal: "..tostring(err))
+		rlog("WARN", ("BUY FAIL uid=%s err=%s"):format(uid, tostring(err)))
 		if consecutiveFail >= BACKOFF_FAIL_COUNT then
 			backoffUntil = os.clock() + BACKOFF_DURATION
 			rlog("WARN", ("Backoff aktif %0.1fs"):format(BACKOFF_DURATION))
@@ -483,7 +322,7 @@ local function rescanAll(reason)
 
 	activeIsland, activeConveyor, activeBelt = island, conveyor, belt
 	sys(("Rescan (%s): ✅ %s → %s (Belt children: %d)"):format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
-	logLine(("RESCAN %s %s %s cnt=%d"):format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
+	rlog("INFO", ("RESCAN %s %s %s cnt=%d"):format(reason, island.Name, conveyor.Name, #belt:GetChildren()))
 
 	-- Pasang Event-Driven listener pada Belt
 	local c1 = belt.ChildAdded:Connect(function(child)
@@ -506,7 +345,7 @@ local function rescanAll(reason)
 	end)
 	addConn(c2)
 
-	renderOverlay()
+	updateDisplay()
 	return true
 end
 
@@ -577,64 +416,21 @@ local function mainLoop()
 			end
 		end
 		task.wait(RESCAN_INTERVAL_SEC)
-		renderOverlay()
+		updateDisplay()
 	end
 	sys("Loop berhenti.")
 end
 
 -- ===============================[ BOOTSTRAP ]================================
 
-ensureDir()
-
--- Load CONFIG & STATE
-do
-	-- Config
-	local cfg = readJson(PATH_CONFIG, nil)
-	if cfg then
-		-- override nilai default jika ada
-		if cfg.ISLAND_PARENT_NAME then ISLAND_PARENT_NAME = cfg.ISLAND_PARENT_NAME end
-		if cfg.DESIRED_MUTATIONS then DESIRED_MUTATIONS = cfg.DESIRED_MUTATIONS end
-		if cfg.CONVEYOR_LEVEL_OVERRIDE ~= nil then CONVEYOR_LEVEL_OVERRIDE = cfg.CONVEYOR_LEVEL_OVERRIDE end
-		if cfg.BUY_COOLDOWN_SEC then BUY_COOLDOWN_SEC = cfg.BUY_COOLDOWN_SEC end
-		if cfg.RESCAN_INTERVAL_SEC then RESCAN_INTERVAL_SEC = cfg.RESCAN_INTERVAL_SEC end
-		if cfg.MAX_BUYS_PER_MIN then MAX_BUYS_PER_MIN = cfg.MAX_BUYS_PER_MIN end
-		if cfg.LAST_BOUGHT_TTL_SEC then LAST_BOUGHT_TTL_SEC = cfg.LAST_BOUGHT_TTL_SEC end
-		if cfg.ENABLE_LOG ~= nil then ENABLE_LOG = cfg.ENABLE_LOG end
-		if cfg.ENABLE_TYPE_FILTER ~= nil then ENABLE_TYPE_FILTER = cfg.ENABLE_TYPE_FILTER end
-		if cfg.TYPE_ALLOW then TYPE_ALLOW = cfg.TYPE_ALLOW end
-	end
-
-	-- State
-	local st = readJson(PATH_STATE, nil)
-	if st then
-		if st.lastBoughtAt then lastBoughtAt = st.lastBoughtAt end
-	end
-end
-
--- Tulis default config jika belum ada
-if not isfile(PATH_CONFIG) then
-	writeJson(PATH_CONFIG, {
-		ISLAND_PARENT_NAME = ISLAND_PARENT_NAME,
-		DESIRED_MUTATIONS = DESIRED_MUTATIONS,
-		CONVEYOR_LEVEL_OVERRIDE = CONVEYOR_LEVEL_OVERRIDE,
-		BUY_COOLDOWN_SEC = BUY_COOLDOWN_SEC,
-		RESCAN_INTERVAL_SEC = RESCAN_INTERVAL_SEC,
-		MAX_BUYS_PER_MIN = MAX_BUYS_PER_MIN,
-		LAST_BOUGHT_TTL_SEC = LAST_BOUGHT_TTL_SEC,
-		ENABLE_LOG = ENABLE_LOG,
-		ENABLE_TYPE_FILTER = ENABLE_TYPE_FILTER,
-		TYPE_ALLOW = TYPE_ALLOW,
-	})
-end
-
 -- Rescan awal
 task.defer(function()
 	rescanAll("initial")
 end)
 
--- Overlay awal
-if OVERLAY_AUTOSHOW then
-	renderOverlay()
+-- Display awal
+if DISPLAY_ENABLED then
+	updateDisplay()
 end
 
 -- ===============================[ CHAT COMMAND ]=============================
@@ -645,30 +441,6 @@ local function listActiveMutations()
 	local t = {}
 	for k,v in pairs(DESIRED_MUTATIONS) do if v then t[#t+1]=k end end
 	table.sort(t); return #t>0 and table.concat(t,", ") or "(kosong)"
-end
-
-local function persistConfig()
-	writeJson(PATH_CONFIG, {
-		ISLAND_PARENT_NAME = ISLAND_PARENT_NAME,
-		DESIRED_MUTATIONS = DESIRED_MUTATIONS,
-		CONVEYOR_LEVEL_OVERRIDE = CONVEYOR_LEVEL_OVERRIDE,
-		BUY_COOLDOWN_SEC = BUY_COOLDOWN_SEC,
-		RESCAN_INTERVAL_SEC = RESCAN_INTERVAL_SEC,
-		MAX_BUYS_PER_MIN = MAX_BUYS_PER_MIN,
-		LAST_BOUGHT_TTL_SEC = LAST_BOUGHT_TTL_SEC,
-		ENABLE_LOG = ENABLE_LOG,
-		ENABLE_TYPE_FILTER = ENABLE_TYPE_FILTER,
-		TYPE_ALLOW = TYPE_ALLOW,
-	})
-end
-
-local function persistState()
-	writeJson(PATH_STATE, {
-		lastBoughtAt = lastBoughtAt,
-		island = activeIsland and activeIsland.Name or nil,
-		conveyor = activeConveyor and activeConveyor.Name or nil,
-		beltCount = (activeBelt and #activeBelt:GetChildren() or 0),
-	})
 end
 
 local function tryParseCommand(msg)
@@ -689,25 +461,23 @@ local function tryParseCommand(msg)
 	elseif sub == "stop" then
 		if running then running = false; sys("Dihentikan.") else sys("Sudah berhenti.") end
 
-	elseif sub == "overlay" then
-		-- toggle overlay
-		overlay.enabled = not overlay.enabled
-		if overlay.enabled then renderOverlay() else destroyOverlay() end
-		sys("Overlay: "..(overlay.enabled and "ON" or "off"))
+	elseif sub == "display" then
+		-- toggle display
+		DISPLAY_ENABLED = not DISPLAY_ENABLED
+		if DISPLAY_ENABLED then updateDisplay() else destroyDisplay() end
+		sys("Display: "..(DISPLAY_ENABLED and "ON" or "off"))
 
 	elseif sub == "rescan" then
 		local ok = rescanAll("manual")
 		if not ok then
 			sys("Rescan gagal. Pastikan kamu berada di dekat island & conveyor yang benar.")
-		else
-			persistState()
 		end
 
 	elseif sub == "unload" then
     	running = false
     	clearConns()
-    	overlay.enabled = false
-    	destroyOverlay()
+    	DISPLAY_ENABLED = false
+    	destroyDisplay()
     	sys("AutoEgg dihentikan dan semua event listener dilepas.")
     return
 
@@ -771,9 +541,8 @@ local function tryParseCommand(msg)
 			sys("Pakai: !buyegg settype <TypeName> on|off   (contoh: !buyegg settype BowserEgg on)")
 		else
 			TYPE_ALLOW[_norm(name)] = (onoff == "on")
-			persistConfig()
 			sys(("Filter type %s: %s"):format(name, onoff == "on" and "ON" or "off"))
-			renderOverlay()
+			updateDisplay()
 		end
 
 	elseif sub == "onlytype" then
@@ -786,24 +555,22 @@ local function tryParseCommand(msg)
 			for token in string.gmatch(list, "([^,]+)") do
 				TYPE_ALLOW[_norm((token:gsub("^%s*(.-)%s*$","%1")))] = true
 			end
-			persistConfig()
 			sys("Filter types di-set eksklusif. Cek dengan !buyegg types")
-			renderOverlay()
+			updateDisplay()
 		end
 
 	elseif sub == "cleartypes" then
 		for k,_ in pairs(TYPE_ALLOW) do TYPE_ALLOW[k] = nil end
-		persistConfig()
 		sys("Filter types dikosongkan (semua tipe diizinkan).")
-		renderOverlay()
+		updateDisplay()
 
 	elseif sub == "status" then
-		sys(("Status: %s | Mutasi aktif: %s | Level: %s | Window buys: %d/min | Overlay: %s")
+		sys(("Status: %s | Mutasi aktif: %s | Level: %s | Window buys: %d/min | Display: %s")
 			:format(running and "BERJALAN" or "BERHENTI",
 				listActiveMutations(),
 				CONVEYOR_LEVEL_OVERRIDE and tostring(CONVEYOR_LEVEL_OVERRIDE) or "auto",
 				#buysWindow,
-				overlay.enabled and "ON" or "off"))
+				DISPLAY_ENABLED and "ON" or "off"))
 
 	elseif sub == "eggs" then
 		local island = findActiveIsland(); if not island then sys("Island?"); return end
@@ -821,19 +588,17 @@ local function tryParseCommand(msg)
 		local p = parts[3]
 		if p == nil or p == "auto" then
 			CONVEYOR_LEVEL_OVERRIDE = nil
-			persistConfig()
 			sys("Conveyor level: AUTO")
 		else
 			local n = tonumber(p)
 			if n then
 				CONVEYOR_LEVEL_OVERRIDE = n
-				persistConfig()
 				sys("Conveyor level di-set ke: "..n)
 			else
 				sys("Pakai: !buyegg setlevel <n|auto>")
 			end
 		end
-		renderOverlay()
+		updateDisplay()
 
 	elseif sub == "setmut" then
 		local name = parts[3]; local onoff = parts[4] and parts[4]:lower()
@@ -842,9 +607,8 @@ local function tryParseCommand(msg)
 			return
 		end
 		DESIRED_MUTATIONS[name] = (onoff == "on")
-		persistConfig()
 		sys("Mutasi aktif sekarang: "..listActiveMutations())
-		renderOverlay()
+		updateDisplay()
 
 	elseif sub == "test" then
 		local island = findActiveIsland(); if not island then sys("Island?"); return end
@@ -864,11 +628,8 @@ local function tryParseCommand(msg)
 		fireBuy(uid)
 
 	else
-		sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | overlay | unload")
+		sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | display | unload")
 	end
-
-	-- Persist state ringan di akhir command
-	persistState()
 end
 
 if TextChatService and TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
@@ -883,4 +644,4 @@ else
 	localPlayer.Chatted:Connect(tryParseCommand)
 end
 
-sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | overlay")
+sys("Perintah: !buyegg start | stop | status | eggs | setmut <Nama> on|off | setlevel <n|auto> | rescan | types | settype <Type> on|off | onlytype <A,B,...> | cleartypes | test | buy <uid> | collect | display")
