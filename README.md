@@ -6,7 +6,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/re
 autobuy egg:
 loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/refs/heads/main/autobuyEgg.lua"))()
 
-script v2 (UI interaktif desktop + mobile):
+script v2 (interactive UI for desktop + mobile):
 loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/refs/heads/main/script%20v2"))()
 
 Kontrol UI:
