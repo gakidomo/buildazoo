@@ -444,7 +444,7 @@ local function createInteractiveUI()
     gui.Parent = PlayerGui
 
     local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-    local topInset = select(1, GuiService:GetGuiInset())
+    local topInset = GuiService:GetGuiInset()
     local panelWidth = isMobile and 340 or 390
     local panelHeight = isMobile and 360 or 310
     local buttonHeight = isMobile and 40 or 32
@@ -680,7 +680,7 @@ LocalPlayer.Chatted:Connect(handleChat)
 createInteractiveUI()
 
 -- ===== Info awal =====
-log("Loaded. Status: STOPPED. Gunakan UI panel atau command chat.")
+log("Loaded. Status: STOPPED. Use the UI panel or chat commands.")
 log("Commands: !start, !stop, !wc on/off, !egg type <T> on/off, !egg mutation <M> on/off")
 
 -- (opsional) kalau mau auto-start saat load, uncomment:
