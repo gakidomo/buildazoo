@@ -444,7 +444,7 @@ local function createInteractiveUI()
     gui.Parent = PlayerGui
 
     local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-    local topInset = GuiService:GetGuiInset()
+    local topInsetY = GuiService:GetGuiInset().Y
     local panelWidth = isMobile and 340 or 390
     local panelHeight = isMobile and 360 or 310
     local buttonHeight = isMobile and 40 or 32
@@ -452,7 +452,7 @@ local function createInteractiveUI()
     local panel = Instance.new("Frame")
     panel.Name = "Panel"
     panel.Size = UDim2.fromOffset(panelWidth, panelHeight)
-    panel.Position = UDim2.fromOffset(16, 16 + topInset.Y)
+    panel.Position = UDim2.fromOffset(16, 16 + topInsetY)
     panel.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
     panel.BackgroundTransparency = 0.1
     panel.BorderSizePixel = 0
@@ -613,7 +613,7 @@ local function createInteractiveUI()
     local dragStart
     local startPos
     local dragInput
-    local dragStateChangedConn
+    local dragConn
     local function updateDrag(input)
         local delta = input.Position - dragStart
         panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
@@ -624,17 +624,17 @@ local function createInteractiveUI()
             dragStart = input.Position
             startPos = panel.Position
             dragInput = input
-            if dragStateChangedConn then
-                dragStateChangedConn:Disconnect()
-                dragStateChangedConn = nil
+            if dragConn then
+                dragConn:Disconnect()
+                dragConn = nil
             end
-            dragStateChangedConn = input.Changed:Connect(function()
+            dragConn = input.Changed:Connect(function()
                 if input.UserInputState == Enum.UserInputState.End then
                     dragInput = nil
                     dragStart = nil
-                    if dragStateChangedConn then
-                        dragStateChangedConn:Disconnect()
-                        dragStateChangedConn = nil
+                    if dragConn then
+                        dragConn:Disconnect()
+                        dragConn = nil
                     end
                 end
             end)
@@ -685,7 +685,7 @@ local function createInteractiveUI()
     refreshUiState()
 end
 
--- Hook chat (tetap aktif sebagai fallback)
+-- Hook chat sengaja persistent agar command tetap bisa dipakai setelah stopScript().
 LocalPlayer.Chatted:Connect(handleChat)
 createInteractiveUI()
 
