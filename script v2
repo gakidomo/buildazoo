@@ -46,7 +46,7 @@ local eggConnections = {}  -- [Instance] = {conn1, conn2, ...}
 -- Island yang sedang aktif
 local activeIslandIndex = nil
 local activeEggsFolder = nil
-local refreshUiState = nil
+local refreshUIState = nil
 
 -- ===== Util: print prefix =====
 local function log(...)
@@ -131,21 +131,21 @@ end
 local function setWildcardMutation(enabled)
     allowEmptyMutation = enabled == true
     log("Wildcard mutation:", allowEmptyMutation and "ON" or "OFF")
-    if refreshUiState then refreshUiState() end
+    if refreshUIState then refreshUIState() end
 end
 
 local function setTypeEnabled(typeName, enabled)
     if not typeName or typeName == "" then return end
     userFilter.types[typeName] = enabled == true
     log(("Type '%s' => %s"):format(typeName, userFilter.types[typeName] and "ON" or "OFF"))
-    if refreshUiState then refreshUiState() end
+    if refreshUIState then refreshUIState() end
 end
 
 local function setMutationEnabled(mutationName, enabled)
     if not mutationName or mutationName == "" then return end
     userFilter.mutations[mutationName] = enabled == true
     log(("Mutation '%s' => %s"):format(mutationName, userFilter.mutations[mutationName] and "ON" or "OFF"))
-    if refreshUiState then refreshUiState() end
+    if refreshUIState then refreshUIState() end
 end
 
 -- ===== Cooldown control =====
@@ -352,7 +352,7 @@ local function stopScript()
     connections = {}
     activeEggsFolder = nil
     log("Stopped. All listeners disconnected.")
-    if refreshUiState then refreshUiState() end
+    if refreshUIState then refreshUIState() end
 end
 
 local function startScript()
@@ -373,7 +373,7 @@ local function startScript()
     end))
 
     log("Started. Listening for eggs on your active island...")
-    if refreshUiState then refreshUiState() end
+    if refreshUIState then refreshUIState() end
 end
 
 -- ===== Chat Commands =====
@@ -430,7 +430,7 @@ local function countEnabled(dict)
     local count = 0
     for _, enabled in pairs(dict) do
         if enabled == true then
-            count += 1
+            count = count + 1
         end
     end
     return count
@@ -614,9 +614,23 @@ local function createInteractiveUI()
     local startPos
     local dragInput
     local dragConn
+    local function clampPanelOffset(offsetX, offsetY)
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return offsetX, offsetY
+        end
+        local viewport = camera.ViewportSize
+        local maxX = math.max(0, viewport.X - panel.AbsoluteSize.X - 8)
+        local maxY = math.max(0, viewport.Y - panel.AbsoluteSize.Y - 8)
+        return math.clamp(offsetX, 0, maxX), math.clamp(offsetY, 0, maxY)
+    end
+
     local function updateDrag(input)
         local delta = input.Position - dragStart
-        panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        local targetX = startPos.X.Offset + delta.X
+        local targetY = startPos.Y.Offset + delta.Y
+        local clampedX, clampedY = clampPanelOffset(targetX, targetY)
+        panel.Position = UDim2.fromOffset(clampedX, clampedY)
     end
 
     header.InputBegan:Connect(function(input)
@@ -671,7 +685,7 @@ local function createInteractiveUI()
         setMutationEnabled(mutationInput.Text, false)
     end)
 
-    refreshUiState = function()
+    refreshUIState = function()
         statusLabel.Text = ("Status: %s | Wildcard: %s | Types ON: %d | Mutations ON: %d"):format(
             running and "RUNNING" or "STOPPED",
             allowEmptyMutation and "ON" or "OFF",
@@ -682,10 +696,10 @@ local function createInteractiveUI()
         startBtn.BackgroundColor3 = running and Color3.fromRGB(42, 104, 61) or Color3.fromRGB(55, 76, 118)
         stopBtn.BackgroundColor3 = running and Color3.fromRGB(115, 62, 62) or Color3.fromRGB(55, 76, 118)
     end
-    refreshUiState()
+    refreshUIState()
 end
 
--- Hook chat sengaja persistent agar command tetap bisa dipakai setelah stopScript().
+-- Hook chat intentionally persistent so commands remain available after stopScript().
 LocalPlayer.Chatted:Connect(handleChat)
 createInteractiveUI()
 
