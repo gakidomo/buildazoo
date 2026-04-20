@@ -5,3 +5,6 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/re
 
 autobuy egg:
 loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/refs/heads/main/autobuyEgg.lua"))()
+
+autobuy GUI version:
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gakidomo/buildazoo/refs/heads/main/autobuyGUI.lua"))()
