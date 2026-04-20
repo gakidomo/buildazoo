@@ -15,8 +15,11 @@ Spesifikasi:
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
 
 local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- ===== Konstanta & State =====
 local ISLAND_COUNT = 6
@@ -43,6 +46,7 @@ local eggConnections = {}  -- [Instance] = {conn1, conn2, ...}
 -- Island yang sedang aktif
 local activeIslandIndex = nil
 local activeEggsFolder = nil
+local refreshUIState = nil
 
 -- ===== Util: print prefix =====
 local function log(...)
@@ -122,6 +126,26 @@ do
     for _, m in ipairs(defaultMuts) do
         userFilter.mutations[m] = true
     end
+end
+
+local function setWildcardMutation(enabled)
+    allowEmptyMutation = enabled == true
+    log("Wildcard mutation:", allowEmptyMutation and "ON" or "OFF")
+    if refreshUIState then refreshUIState() end
+end
+
+local function setTypeEnabled(typeName, enabled)
+    if not typeName or typeName == "" then return end
+    userFilter.types[typeName] = enabled == true
+    log(("Type '%s' => %s"):format(typeName, userFilter.types[typeName] and "ON" or "OFF"))
+    if refreshUIState then refreshUIState() end
+end
+
+local function setMutationEnabled(mutationName, enabled)
+    if not mutationName or mutationName == "" then return end
+    userFilter.mutations[mutationName] = enabled == true
+    log(("Mutation '%s' => %s"):format(mutationName, userFilter.mutations[mutationName] and "ON" or "OFF"))
+    if refreshUIState then refreshUIState() end
 end
 
 -- ===== Cooldown control =====
@@ -328,6 +352,7 @@ local function stopScript()
     connections = {}
     activeEggsFolder = nil
     log("Stopped. All listeners disconnected.")
+    if refreshUIState then refreshUIState() end
 end
 
 local function startScript()
@@ -348,6 +373,7 @@ local function startScript()
     end))
 
     log("Started. Listening for eggs on your active island...")
+    if refreshUIState then refreshUIState() end
 end
 
 -- ===== Chat Commands =====
@@ -368,8 +394,7 @@ local function handleChat(msg)
     do
         local cmd, state = low:match("^!wc%s+(on|off)$")
         if cmd and state then
-            allowEmptyMutation = (state == "on")
-            log("Wildcard mutation:", allowEmptyMutation and "ON" or "OFF")
+            setWildcardMutation(state == "on")
             return
         end
     end
@@ -382,8 +407,7 @@ local function handleChat(msg)
             -- Kita ambil original token dari msg untuk menjaga kapitalisasi
             local _, _, _, rawName, rawState = msg:find("^!egg%s+(type)%s+(%S+)%s+(on|off)$")
             if rawName and rawState then
-                userFilter.types[rawName] = (rawState:lower() == "on")
-                log(("Type '%s' => %s"):format(rawName, userFilter.types[rawName] and "ON" or "OFF"))
+                setTypeEnabled(rawName, rawState:lower() == "on")
             end
             return
         end
@@ -395,20 +419,292 @@ local function handleChat(msg)
         if kind and name and state then
             local _, _, _, rawName, rawState = msg:find("^!egg%s+(mutation)%s+(%S+)%s+(on|off)$")
             if rawName and rawState then
-                userFilter.mutations[rawName] = (rawState:lower() == "on")
-                log(("Mutation '%s' => %s"):format(rawName, userFilter.mutations[rawName] and "ON" or "OFF"))
+                setMutationEnabled(rawName, rawState:lower() == "on")
             end
             return
         end
     end
 end
 
--- Hook chat
-local chatConn = LocalPlayer.Chatted:Connect(handleChat)
-trackConnection(chatConn)
+local function countEnabled(dict)
+    local count = 0
+    for _, enabled in pairs(dict) do
+        if enabled == true then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function createInteractiveUI()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AutoBuyEggUI"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.Parent = PlayerGui
+
+    local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+    local topInsetY = GuiService:GetGuiInset().Y
+    local panelWidth = isMobile and 340 or 390
+    local panelHeight = isMobile and 360 or 310
+    local buttonHeight = isMobile and 40 or 32
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.Size = UDim2.fromOffset(panelWidth, panelHeight)
+    panel.Position = UDim2.fromOffset(16, 16 + topInsetY)
+    panel.BackgroundColor3 = Color3.fromRGB(18, 22, 30)
+    panel.BackgroundTransparency = 0.1
+    panel.BorderSizePixel = 0
+    panel.Parent = gui
+
+    local panelCorner = Instance.new("UICorner")
+    panelCorner.CornerRadius = UDim.new(0, 12)
+    panelCorner.Parent = panel
+
+    local panelStroke = Instance.new("UIStroke")
+    panelStroke.Thickness = 1
+    panelStroke.Color = Color3.fromRGB(80, 130, 220)
+    panelStroke.Parent = panel
+
+    local sizeConstraint = Instance.new("UISizeConstraint")
+    sizeConstraint.MaxSize = Vector2.new(420, 480)
+    sizeConstraint.MinSize = Vector2.new(300, 260)
+    sizeConstraint.Parent = panel
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 38)
+    header.BackgroundColor3 = Color3.fromRGB(30, 40, 58)
+    header.BorderSizePixel = 0
+    header.Parent = panel
+
+    local headerCorner = Instance.new("UICorner")
+    headerCorner.CornerRadius = UDim.new(0, 12)
+    headerCorner.Parent = header
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -12, 1, 0)
+    title.Position = UDim2.fromOffset(12, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "Auto Buy Egg Control"
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = isMobile and 15 or 14
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Color3.fromRGB(240, 244, 255)
+    title.Parent = header
+
+    local content = Instance.new("ScrollingFrame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -16, 1, -50)
+    content.Position = UDim2.fromOffset(8, 42)
+    content.CanvasSize = UDim2.new(0, 0, 0, 0)
+    content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    content.ScrollBarThickness = 6
+    content.BackgroundTransparency = 1
+    content.BorderSizePixel = 0
+    content.Parent = panel
+
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 8)
+    list.Parent = content
+
+    local function newLabel(text, size)
+        local lbl = Instance.new("TextLabel")
+        lbl.BackgroundTransparency = 1
+        lbl.Size = UDim2.new(1, 0, 0, size or 20)
+        lbl.TextWrapped = true
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = isMobile and 14 or 13
+        lbl.TextColor3 = Color3.fromRGB(220, 230, 245)
+        lbl.Text = text
+        lbl.Parent = content
+        return lbl
+    end
+
+    local function newButton(parent, text, widthScale)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(widthScale, -6, 0, buttonHeight)
+        btn.BackgroundColor3 = Color3.fromRGB(55, 76, 118)
+        btn.TextColor3 = Color3.fromRGB(245, 250, 255)
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = isMobile and 14 or 13
+        btn.Text = text
+        btn.BorderSizePixel = 0
+        btn.Parent = parent
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = btn
+        return btn
+    end
+
+    local statusLabel = newLabel("", 52)
+    statusLabel.AutomaticSize = Enum.AutomaticSize.Y
+
+    local row1 = Instance.new("Frame")
+    row1.Size = UDim2.new(1, 0, 0, buttonHeight)
+    row1.BackgroundTransparency = 1
+    row1.Parent = content
+    local row1Layout = Instance.new("UIListLayout")
+    row1Layout.FillDirection = Enum.FillDirection.Horizontal
+    row1Layout.Padding = UDim.new(0, 8)
+    row1Layout.Parent = row1
+
+    local startBtn = newButton(row1, "Start", 1/3)
+    local stopBtn = newButton(row1, "Stop", 1/3)
+    local wildcardBtn = newButton(row1, "Wildcard: OFF", 1/3)
+
+    newLabel("Type filter (case-sensitive):", 20)
+    local typeRow = Instance.new("Frame")
+    typeRow.Size = UDim2.new(1, 0, 0, buttonHeight)
+    typeRow.BackgroundTransparency = 1
+    typeRow.Parent = content
+    local typeLayout = Instance.new("UIListLayout")
+    typeLayout.FillDirection = Enum.FillDirection.Horizontal
+    typeLayout.Padding = UDim.new(0, 8)
+    typeLayout.Parent = typeRow
+
+    local typeInput = Instance.new("TextBox")
+    typeInput.Size = UDim2.new(0.5, -6, 1, 0)
+    typeInput.BackgroundColor3 = Color3.fromRGB(37, 44, 58)
+    typeInput.TextColor3 = Color3.fromRGB(240, 245, 255)
+    typeInput.Font = Enum.Font.Gotham
+    typeInput.TextSize = isMobile and 14 or 13
+    typeInput.PlaceholderText = "EpicEgg"
+    typeInput.ClearTextOnFocus = false
+    typeInput.BorderSizePixel = 0
+    typeInput.Parent = typeRow
+    local typeCorner = Instance.new("UICorner")
+    typeCorner.CornerRadius = UDim.new(0, 8)
+    typeCorner.Parent = typeInput
+
+    local typeOnBtn = newButton(typeRow, "Type ON", 0.25)
+    local typeOffBtn = newButton(typeRow, "Type OFF", 0.25)
+
+    newLabel("Mutation filter (case-sensitive):", 20)
+    local mutRow = Instance.new("Frame")
+    mutRow.Size = UDim2.new(1, 0, 0, buttonHeight)
+    mutRow.BackgroundTransparency = 1
+    mutRow.Parent = content
+    local mutLayout = Instance.new("UIListLayout")
+    mutLayout.FillDirection = Enum.FillDirection.Horizontal
+    mutLayout.Padding = UDim.new(0, 8)
+    mutLayout.Parent = mutRow
+
+    local mutationInput = Instance.new("TextBox")
+    mutationInput.Size = UDim2.new(0.5, -6, 1, 0)
+    mutationInput.BackgroundColor3 = Color3.fromRGB(37, 44, 58)
+    mutationInput.TextColor3 = Color3.fromRGB(240, 245, 255)
+    mutationInput.Font = Enum.Font.Gotham
+    mutationInput.TextSize = isMobile and 14 or 13
+    mutationInput.PlaceholderText = "Golden"
+    mutationInput.ClearTextOnFocus = false
+    mutationInput.BorderSizePixel = 0
+    mutationInput.Parent = mutRow
+    local mutCorner = Instance.new("UICorner")
+    mutCorner.CornerRadius = UDim.new(0, 8)
+    mutCorner.Parent = mutationInput
+
+    local mutOnBtn = newButton(mutRow, "Mut ON", 0.25)
+    local mutOffBtn = newButton(mutRow, "Mut OFF", 0.25)
+
+    newLabel("Chat fallback: !start, !stop, !wc on/off, !egg type <T> on/off, !egg mutation <M> on/off", 48)
+
+    local dragStart
+    local startPos
+    local dragInput
+    local dragConn
+    local function clampPanelOffset(offsetX, offsetY)
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return offsetX, offsetY
+        end
+        local viewport = camera.ViewportSize
+        local maxX = math.max(0, viewport.X - panel.AbsoluteSize.X - 8)
+        local maxY = math.max(0, viewport.Y - panel.AbsoluteSize.Y - 8)
+        return math.clamp(offsetX, 0, maxX), math.clamp(offsetY, 0, maxY)
+    end
+
+    local function updateDrag(input)
+        local delta = input.Position - dragStart
+        local targetX = startPos.X.Offset + delta.X
+        local targetY = startPos.Y.Offset + delta.Y
+        local clampedX, clampedY = clampPanelOffset(targetX, targetY)
+        panel.Position = UDim2.fromOffset(clampedX, clampedY)
+    end
+
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragStart = input.Position
+            startPos = panel.Position
+            dragInput = input
+            if dragConn then
+                dragConn:Disconnect()
+                dragConn = nil
+            end
+            dragConn = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragInput = nil
+                    dragStart = nil
+                    if dragConn then
+                        dragConn:Disconnect()
+                        dragConn = nil
+                    end
+                end
+            end)
+        end
+    end)
+
+    header.InputChanged:Connect(function(input)
+        if dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragStart and startPos then
+            updateDrag(input)
+        end
+    end)
+
+    startBtn.MouseButton1Click:Connect(startScript)
+    stopBtn.MouseButton1Click:Connect(stopScript)
+    wildcardBtn.MouseButton1Click:Connect(function()
+        setWildcardMutation(not allowEmptyMutation)
+    end)
+    typeOnBtn.MouseButton1Click:Connect(function()
+        setTypeEnabled(typeInput.Text, true)
+    end)
+    typeOffBtn.MouseButton1Click:Connect(function()
+        setTypeEnabled(typeInput.Text, false)
+    end)
+    mutOnBtn.MouseButton1Click:Connect(function()
+        setMutationEnabled(mutationInput.Text, true)
+    end)
+    mutOffBtn.MouseButton1Click:Connect(function()
+        setMutationEnabled(mutationInput.Text, false)
+    end)
+
+    refreshUIState = function()
+        statusLabel.Text = ("Status: %s | Wildcard: %s | Types ON: %d | Mutations ON: %d"):format(
+            running and "RUNNING" or "STOPPED",
+            allowEmptyMutation and "ON" or "OFF",
+            countEnabled(userFilter.types),
+            countEnabled(userFilter.mutations)
+        )
+        wildcardBtn.Text = "Wildcard: " .. (allowEmptyMutation and "ON" or "OFF")
+        startBtn.BackgroundColor3 = running and Color3.fromRGB(42, 104, 61) or Color3.fromRGB(55, 76, 118)
+        stopBtn.BackgroundColor3 = running and Color3.fromRGB(115, 62, 62) or Color3.fromRGB(55, 76, 118)
+    end
+    refreshUIState()
+end
+
+-- Hook chat intentionally persistent so commands remain available after stopScript().
+LocalPlayer.Chatted:Connect(handleChat)
+createInteractiveUI()
 
 -- ===== Info awal =====
-log("Loaded. Status: STOPPED (use !start). Wildcard mutation: OFF")
+log("Loaded. Status: STOPPED. Use the UI panel or chat commands.")
 log("Commands: !start, !stop, !wc on/off, !egg type <T> on/off, !egg mutation <M> on/off")
 
 -- (opsional) kalau mau auto-start saat load, uncomment:
